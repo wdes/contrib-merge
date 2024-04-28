@@ -1,0 +1,231 @@
+#!/usr/bin/env php
+<?php
+
+final class ContribMerge {
+    private static string $OWNER = 'phpmyadmin';
+    private static string $REPO = 'phpmyadmin';
+
+    public static function run(array $options) {
+        if (! isset($options['pr']) || empty($options['pr'])) {
+            echo 'Use: contrib-merge --pr 123';
+            echo 'Use: contrib-merge --pr 123 --changelog';
+	    echo 'Use: contrib-merge --pr 123 --merge';
+	    echo 'Use: contrib-merge --pr 1 --owner sudo-bot --repo action-docker-sign --merge';	    
+	    exit(1);
+        }
+
+        if (isset($options['owner']) && ! empty($options['owner'])) {
+            self::$OWNER = $options['owner'];
+        }
+        if (isset($options['repo']) && ! empty($options['repo'])) {
+            self::$REPO = $options['repo'];
+        }
+	echo 'Slug: ' . self::$OWNER . '/' . self::$REPO . PHP_EOL;
+        $changeLogMode = isset($options['changelog']);
+        $mergeMode = isset($options['merge']);
+        $prId = $options['pr'];
+        match ($changeLogMode) {
+            true => self::changeLogPr($prId),
+            false => self::mergePr($prId, $mergeMode),
+        };
+    }
+
+    private static function getIssue(int $issueId): array
+    {
+        return self::ghAPI(
+            sprintf(
+                '/repos/%s/%s/issues/%s',
+                self::$OWNER,
+                self::$REPO,
+                $issueId
+            )
+        );
+
+    }
+
+    private static function changeLogPr(int $prId): void
+    {
+        $prData = self::ghAPI(
+            sprintf(
+                '/repos/%s/%s/pulls/%s',
+                self::$OWNER,
+                self::$REPO,
+                $prId
+            )
+        );
+
+        echo 'Title: ' . $prData['title'] . PHP_EOL;
+        $links = self::getLinks($prData['body']);
+        echo '--Fixes--' . PHP_EOL;
+        foreach ($links['fixes'] as $issueId) {
+            $issueData = self::getIssue($issueId);
+            echo '- issue #' . $issueId . ' ' . $issueData['title'] . PHP_EOL;
+        }
+        echo '--Closes--' . PHP_EOL;
+        foreach ($links['closes'] as $issueId) {
+            $issueData = self::getIssue($issueId);
+            echo '- issue #' . $issueId . ' ' . $issueData['title'] . PHP_EOL;
+        }
+    }
+
+    private static function mergePr(int $prId, bool $doMerge): void
+    {
+        $prData = self::ghAPI(
+            sprintf(
+                '/repos/%s/%s/pulls/%s',
+                self::$OWNER,
+                self::$REPO,
+                $prId
+            )
+        );
+
+        //var_dump($prData['body']);
+        echo 'Title: ' . $prData['title'] . PHP_EOL;
+        echo 'Body: ' . PHP_EOL . $prData['body'] . PHP_EOL;
+        $links = self::getLinks($prData['body']);
+        $fixesCloses = '';
+        foreach ($links['fixes'] as $issueId) {
+            $fixesCloses .= 'Fixes: #' . $issueId . PHP_EOL;
+        }
+        foreach ($links['closes'] as $issueId) {
+            $fixesCloses .= 'Closes: #' . $issueId . PHP_EOL;
+        }
+        $remoteName = $prData['head']['user']['login'];
+
+	$repoURL = $prData['head']['repo']['ssh_url'];
+        self::addRemoteIfMissingAndFetch($repoURL, $remoteName);
+        echo 'Merge template: ' . PHP_EOL;
+        $prTitle = $prData["title"];
+        $mergeMsg = <<<MD
+        Merge #$prId - $prTitle
+
+        Pull-request: #$prId
+        $fixesCloses
+
+        Signed-off-by: William Desportes <williamdes@wdes.fr>
+        MD;
+
+        $repoPath = getcwd();
+        $branchName = $prData['head']['ref'];
+        if ($doMerge === false) {
+            echo 'Branch ' . $remoteName . '/' . $branchName . PHP_EOL;
+	    echo 'Merge message: ' . PHP_EOL;
+            echo $mergeMsg;
+        }
+        if ($doMerge) {
+            echo 'Merging branch ' . $remoteName . '/' . $branchName . PHP_EOL;
+	    $mergeMsg = escapeshellarg($mergeMsg);
+            $gitRemotes = shell_exec(
+                <<<SH
+                cd '$repoPath';
+                git merge '$remoteName/$branchName' -m $mergeMsg;
+                SH
+            );
+        }
+    }
+
+    private static function addRemoteIfMissingAndFetch(string $remoteUrl, string $remoteName): void
+    {
+        $repoPath = getcwd();
+        $gitRemotes = shell_exec(
+            <<<SH
+            cd '$repoPath';
+            git remote -v;
+            SH
+        );
+        echo 'Remote (' . $remoteName . '): ' . $remoteUrl . PHP_EOL;
+
+        if (! str_contains($gitRemotes, $remoteUrl)) {
+            echo 'Adding remote ' . $remoteName . PHP_EOL;
+            shell_exec(
+                <<<SH
+                cd '$repoPath';
+                git remote add $remoteName $remoteUrl;
+                SH
+            );
+        }
+        echo 'Fetching remote ' . $remoteName . PHP_EOL;
+        shell_exec(
+            <<<SH
+            cd '$repoPath';
+            git fetch $remoteName;
+            SH
+        );
+    }
+
+    private static function getLinks(string $content): array
+    {
+        $reFixes = '/fixes(?:|:) #(\d+)/mi';
+        $reCloses = '/closes(?:|:) #(\d+)/mi';
+
+        $matchesFixes = [];
+        $matchesCloses = [];
+
+        preg_match_all($reFixes, $content, $matchesFixes, PREG_PATTERN_ORDER);
+
+        preg_match_all($reCloses, $content, $matchesCloses, PREG_PATTERN_ORDER);
+
+        return [
+            'fixes' => $matchesFixes[1],
+            'closes' => $matchesCloses[1],
+        ];
+    }
+
+    private static function ghAPI(string $path,string $method = 'GET') {
+        return json_decode(self::makeRequest(
+            'https://api.github.com' . $path,
+            [
+                'Accept' => 'application/vnd.github+json',
+                'X-GitHub-Api-Version' => '2022-11-28',
+            ],
+            $method
+        ), true);
+    }
+
+    /**
+     * Make a HTTP request
+     *
+     * @param string $url The URL
+     * @param array<string,string>|string[] $http_headers The headers
+     * @param string $method The HTTP verb
+     * @return string The output
+     */
+    protected static function makeRequest(string $url, array $http_headers, string $method): string
+    {
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_USERAGENT, 'phpMyAdmin contribution merger');
+        curl_setopt($ch, CURLOPT_HEADER, false);
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $http_headers);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        $dataOut = curl_exec($ch);
+        //$httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        if (curl_errno($ch) !== 0) {
+            $errorNo = curl_errno($ch);
+            $description = curl_strerror($errorNo);
+            echo sprintf(
+                'cURL error (%d: %s) for url %s',
+                $errorNo,
+                $description,
+                $url
+            );
+            curl_close($ch);
+            return '';
+        }
+        curl_close($ch);
+        return $dataOut;
+    }
+}
+
+$longopts  = array(
+    'pr:',// Required value
+    'changelog::',// Optional value
+    'merge::',// Optional value
+    'owner:',// Required value
+    'repo:',// Required value
+);
+$options = getopt($shortopts = '', $longopts);
+ContribMerge::run($options);
+echo PHP_EOL;
