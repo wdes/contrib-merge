@@ -1,26 +1,70 @@
 #!/usr/bin/env php
 <?php
 
+/**
+ * @version 1.1.0-dev
+ */
+
 final class ContribMerge {
-    private static string $OWNER = 'phpmyadmin';
-    private static string $REPO = 'phpmyadmin';
+    private static string $OWNER = '';
+    private static string $REPO = '';
 
     public static function run(array $options) {
         if (! isset($options['pr']) || empty($options['pr'])) {
-            echo 'Use: contrib-merge --pr 123';
-            echo 'Use: contrib-merge --pr 123 --changelog';
-	    echo 'Use: contrib-merge --pr 123 --merge';
-	    echo 'Use: contrib-merge --pr 1 --owner sudo-bot --repo action-docker-sign --merge';	    
-	    exit(1);
+            echo 'Use: contrib-merge --pr 123' . PHP_EOL;
+            echo 'Use: contrib-merge --pr 123 --changelog' . PHP_EOL;
+            echo 'Use: contrib-merge --pr 123 --merge' . PHP_EOL;
+            echo 'Use: contrib-merge --pr 1 --owner williamdes --repo test-repo --merge' . PHP_EOL;
+            echo 'Use: contrib-merge --pr 1 --org sudo-bot --repo action-docker-sign --merge' . PHP_EOL;
+            exit(1);
         }
 
         if (isset($options['owner']) && ! empty($options['owner'])) {
             self::$OWNER = $options['owner'];
         }
+        if (isset($options['org']) && ! empty($options['org'])) {
+            self::$OWNER = $options['org'];
+        }
         if (isset($options['repo']) && ! empty($options['repo'])) {
             self::$REPO = $options['repo'];
         }
-	echo 'Slug: ' . self::$OWNER . '/' . self::$REPO . PHP_EOL;
+
+        // Try to auto detect
+        if (empty(self::$OWNER) && empty(self::$REPO)) {
+            $repoPath = getcwd();
+            $gitRemoteOrigin = shell_exec(
+                <<<SH
+                cd '$repoPath';
+                git remote get-url origin;
+                SH
+            );
+            if (! empty($gitRemoteOrigin)) {
+                $matches = [];
+                $regexGitUrl = '/(?<org>[a-z0-9_-]+)\/(?<repo>[a-z0-9_-]+)(:?\.git$|$)/i';
+                preg_match_all($regexGitUrl, $gitRemoteOrigin, $matches);
+
+                self::$OWNER = $matches['org'][0] ?? '';
+                self::$REPO = $matches['repo'][0] ?? '';
+                if (empty(self::$OWNER) || empty(self::$REPO)) {
+                    echo 'Unable to auto detect the slug from remote URL: ' . $gitRemoteOrigin . PHP_EOL;
+                } else {
+                    echo '--Auto detected settings--' . PHP_EOL;
+                    echo 'Owner/org: ' . self::$OWNER . PHP_EOL;
+                    echo 'Repo: ' . self::$REPO . PHP_EOL;
+                    echo '--Auto detected settings--' . PHP_EOL;
+                }
+            }
+        }
+
+
+        if (empty(self::$OWNER) || empty(self::$REPO)) {
+            echo 'Missing repo or owner/org' . PHP_EOL;
+            echo 'Owner/org: ' . self::$OWNER . PHP_EOL;
+            echo 'Repo: ' . self::$REPO . PHP_EOL;
+            exit(1);
+        }
+
+        echo 'Slug: ' . self::$OWNER . '/' . self::$REPO . PHP_EOL;
         $changeLogMode = isset($options['changelog']);
         $mergeMode = isset($options['merge']);
         $prId = $options['pr'];
@@ -82,51 +126,86 @@ final class ContribMerge {
         //var_dump($prData['body']);
         echo 'Title: ' . $prData['title'] . PHP_EOL;
         echo 'Body: ' . PHP_EOL . $prData['body'] . PHP_EOL;
-        $links = self::getLinks($prData['body']);
-        $fixesCloses = '';
+        $links = self::getLinks($prData['body'] ?? '');
+        $specialMentions = '';
         foreach ($links['fixes'] as $issueId) {
-            $fixesCloses .= 'Fixes: #' . $issueId . PHP_EOL;
+            $specialMentions .= 'Fixes: #' . $issueId . PHP_EOL;
         }
         foreach ($links['closes'] as $issueId) {
-            $fixesCloses .= 'Closes: #' . $issueId . PHP_EOL;
+            $specialMentions .= 'Closes: #' . $issueId . PHP_EOL;
+        }
+        foreach ($links['custom'] as $linkName => $links) {
+            foreach ($links as $link) {
+                $specialMentions .= $linkName . ': ' . $link . PHP_EOL;
+            }
         }
         $remoteName = $prData['head']['user']['login'];
 
-	$repoURL = $prData['head']['repo']['ssh_url'];
-        self::addRemoteIfMissingAndFetch($repoURL, $remoteName);
+        $repoURL = $prData['head']['repo']['ssh_url'];
+        // The remote name may change
+        $remoteName = self::addRemoteIfMissingAndFetch($repoURL, $remoteName);
         echo 'Merge template: ' . PHP_EOL;
         $prTitle = $prData["title"];
         $mergeMsg = <<<MD
         Merge #$prId - $prTitle
 
         Pull-request: #$prId
-        $fixesCloses
+        $specialMentions
 
-        Signed-off-by: William Desportes <williamdes@wdes.fr>
         MD;
 
         $repoPath = getcwd();
         $branchName = $prData['head']['ref'];
         if ($doMerge === false) {
             echo 'Branch ' . $remoteName . '/' . $branchName . PHP_EOL;
-	    echo 'Merge message: ' . PHP_EOL;
+            echo 'Merge message: ' . PHP_EOL;
             echo $mergeMsg;
         }
         if ($doMerge) {
             echo 'Merging branch ' . $remoteName . '/' . $branchName . PHP_EOL;
-	    $mergeMsg = escapeshellarg($mergeMsg);
+            $mergeMsg = escapeshellarg($mergeMsg);
+            $signoff = trim(shell_exec(
+                <<<SH
+                cd '$repoPath';
+                git config format.signoff;
+                SH
+            ) ?? '');
+
+            $signoffOption = $signoff !== 'false' ? '--signoff' : '';
             $gitRemotes = shell_exec(
                 <<<SH
                 cd '$repoPath';
-                git merge '$remoteName/$branchName' -m $mergeMsg;
+                git merge '$remoteName/$branchName' --no-ff $signoffOption -m $mergeMsg;
                 SH
             );
         }
     }
 
-    private static function addRemoteIfMissingAndFetch(string $remoteUrl, string $remoteName): void
+    private static function addRemoteIfMissingAndFetch(string $remoteUrl, string $remoteName): string
     {
         $repoPath = getcwd();
+
+        $gitRemoteOrigin = shell_exec(
+            <<<SH
+            cd '$repoPath';
+            git remote get-url origin;
+            SH
+        );
+
+        // If the origin exists as "origin", then use it
+        if (trim($gitRemoteOrigin) === $remoteUrl) {
+            $remoteName = 'origin';
+
+            echo 'Fetching remote ' . $remoteName . PHP_EOL;
+            shell_exec(
+                <<<SH
+                cd '$repoPath';
+                git fetch $remoteName;
+                SH
+            );
+            return $remoteName;
+        }
+
         $gitRemotes = shell_exec(
             <<<SH
             cd '$repoPath';
@@ -151,12 +230,38 @@ final class ContribMerge {
             git fetch $remoteName;
             SH
         );
+        return $remoteName;
     }
 
     private static function getLinks(string $content): array
     {
         $reFixes = '/fixes(?:|:) #(\d+)/mi';
         $reCloses = '/closes(?:|:) #(\d+)/mi';
+        $repoPath = getcwd();
+        $contribMergeFromats = shell_exec(
+            <<<SH
+            cd '$repoPath';
+            git config contrib-merge.format;
+            SH
+        );
+
+        $customFormats = [];
+        if (! empty($contribMergeFromats)) {
+            $matches = [];
+            preg_match_all($contribMergeFromats, $content, $matches, PREG_SET_ORDER);
+            foreach ($matches as $match) {
+                foreach ($match as $matchKey => $matchResult) {
+                    if (is_numeric($matchKey)) {
+                        continue;
+                    }
+                    if (! isset($customFormats[$matchKey])) {
+                        $customFormats[$matchKey] = [];
+                    }
+                    $customFormats[$matchKey][] = trim($matchResult);
+                }
+            }
+        }
+
 
         $matchesFixes = [];
         $matchesCloses = [];
@@ -168,18 +273,52 @@ final class ContribMerge {
         return [
             'fixes' => $matchesFixes[1],
             'closes' => $matchesCloses[1],
+            'custom' => $customFormats,
         ];
     }
 
-    private static function ghAPI(string $path,string $method = 'GET') {
-        return json_decode(self::makeRequest(
-            'https://api.github.com' . $path,
-            [
+    private static function ghAPI(string $path, string $method = 'GET') {
+        $currentDir = getcwd();
+        $token = null;
+        if ($currentDir && is_dir($currentDir)) {
+            $token = shell_exec(
+                <<<SH
+                git config github.token
+                SH
+            );
+        }
+        if ($token !== null) {
+            $token = trim($token);
+            echo 'Using the token from the GitHub local config at: ' . $currentDir . PHP_EOL;
+        }
+
+        $headers = empty($token) ? [
                 'Accept' => 'application/vnd.github+json',
                 'X-GitHub-Api-Version' => '2022-11-28',
-            ],
+            ]
+            :
+            [
+                'Authorization' => 'Bearer ' . $token,
+                'Accept' => 'application/vnd.github+json',
+                'X-GitHub-Api-Version' => '2022-11-28',
+            ];
+
+        $data = json_decode(self::makeRequest(
+            'https://api.github.com' . $path,
+            $headers,
             $method
         ), true);
+
+        if (isset($data['status']) && ((int) $data['status']) !== 200) {
+            echo 'Path: ' . $path . PHP_EOL;
+            echo 'Headers: ' . json_encode($headers, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
+            echo 'Status (from json): ' . $data['status'] . PHP_EOL;
+            echo $data['message'] . PHP_EOL;
+            echo ($data['documentation_url'] ?? '' ). PHP_EOL;
+            exit(1);
+        }
+
+        return $data;
     }
 
     /**
@@ -194,10 +333,14 @@ final class ContribMerge {
     {
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $url);
-        curl_setopt($ch, CURLOPT_USERAGENT, 'phpMyAdmin contribution merger');
+        curl_setopt($ch, CURLOPT_USERAGENT, '@wdes contribution merger');
         curl_setopt($ch, CURLOPT_HEADER, false);
         curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, $http_headers);
+        $headersToSend = [];
+        foreach ($http_headers as $headerName => $headerValue) {
+            $headersToSend[] = $headerName . ': ' . $headerValue;
+        }
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headersToSend);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         $dataOut = curl_exec($ch);
         //$httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -221,9 +364,10 @@ final class ContribMerge {
 
 $longopts  = array(
     'pr:',// Required value
-    'changelog::',// Optional value
-    'merge::',// Optional value
+    'changelog',// No value
+    'merge',// No value
     'owner:',// Required value
+    'org:',// Required value
     'repo:',// Required value
 );
 $options = getopt($shortopts = '', $longopts);
