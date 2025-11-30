@@ -2,7 +2,7 @@
 <?php
 
 /**
- * @version 1.4.0
+ * @version 1.5.0
  */
 
 final class ContribMerge {
@@ -123,7 +123,13 @@ final class ContribMerge {
             )
         );
 
-        //var_dump($prData['body']);
+        //var_dump($prData['head']);
+        echo 'By: ' . $prData['head']['user']['login'] . ' (' . $prData['author_association'] . ')' . PHP_EOL;
+        echo 'Stats: commits: ' . $prData['commits']
+            . ', add: ' . $prData['additions']
+            . ', del: ' . $prData['deletions']
+            . ', mod: ' . $prData['changed_files']
+            . PHP_EOL;
         echo 'Title: ' . $prData['title'] . PHP_EOL;
         echo 'Body: ' . PHP_EOL . $prData['body'] . PHP_EOL;
         $links = self::getLinks($prData['body'] ?? '');
@@ -141,10 +147,20 @@ final class ContribMerge {
         }
         $remoteName = $prData['head']['user']['login'];
 
-        $repoURL = $prData['head']['repo']['ssh_url'];
-        // The remote name may change
-        $remoteName = self::addRemoteIfMissingAndFetch($repoURL, $remoteName);
-        echo 'Merge template: ' . PHP_EOL;
+        $mergeRemoteUrl = $prData['head']['repo']['ssh_url'];
+        $baseRemoteUrl = $prData['base']['repo']['ssh_url'];
+        $branchMergedIntoRef = $prData['base']['ref'];
+        $branchRef = $prData['head']['ref'];
+        $branchShaRef = $prData['head']['sha'];
+
+        $mergeRef = self::addRemoteIfMissingAndFetch(
+            $baseRemoteUrl,
+            $mergeRemoteUrl,
+            $remoteName,
+            $branchRef,
+            $branchShaRef,
+            $prId
+        );
         $prTitle = $prData["title"];
         $mergeMsg = <<<MD
         Merge #$prId - $prTitle
@@ -155,14 +171,40 @@ final class ContribMerge {
         MD;
 
         $repoPath = getcwd();
-        $branchName = $prData['head']['ref'];
         if ($doMerge === false) {
-            echo 'Branch ' . $remoteName . '/' . $branchName . PHP_EOL;
+            echo 'Branch ' . $mergeRef . PHP_EOL;
             echo 'Merge message: ' . PHP_EOL;
+            echo 'Merge template: ' . PHP_EOL;
             echo $mergeMsg;
         }
         if ($doMerge) {
-            echo 'Merging branch ' . $remoteName . '/' . $branchName . PHP_EOL;
+            if ($prData['merged']) {
+                echo 'Already merged ! ' . PHP_EOL;
+                exit(1);
+            }
+            $isRepoClean = trim(shell_exec(
+                <<<SH
+                cd '$repoPath';
+                git status --porcelain;
+                SH
+            ) ?? '');
+            if ($isRepoClean !== '') {
+                echo 'The repository is not clean ! ' . PHP_EOL;
+                exit(1);
+            }
+            $currentBranch = trim(shell_exec(
+                <<<SH
+                cd '$repoPath';
+                git branch --show-current;
+                SH
+            ) ?? '');
+
+            if ($currentBranch !== $branchMergedIntoRef) {
+                echo 'The current branch is not the branch ' . $branchMergedIntoRef . ' ! ' . PHP_EOL;
+                exit(1);
+            }
+
+            echo 'Merging branch ' . $mergeRef . ' into ' . $branchMergedIntoRef . PHP_EOL;
             $mergeMsg = escapeshellarg($mergeMsg);
             $signoff = trim(shell_exec(
                 <<<SH
@@ -175,25 +217,98 @@ final class ContribMerge {
             $gitRemotes = shell_exec(
                 <<<SH
                 cd '$repoPath';
-                git merge '$remoteName/$branchName' --no-ff $signoffOption -m $mergeMsg;
+                git merge '$mergeRef' --no-ff $signoffOption -m $mergeMsg;
                 SH
             );
         }
     }
 
-    private static function addRemoteIfMissingAndFetch(string $remoteUrl, string $remoteName): string
+    /**
+     * @param string $baseRemoteUrl The repo to merge into
+     * @param string $mergeRemoteUrl The repo asking for the merge
+     */
+    private static function addRemoteIfMissingAndFetch(
+        string $baseRemoteUrl, string $mergeRemoteUrl, string $remoteName, string $branchRef, string $branchShaRef, int $prId
+    ): string
     {
         $repoPath = getcwd();
 
-        $gitRemoteOrigin = shell_exec(
-            <<<SH
-            cd '$repoPath';
-            git remote get-url origin;
-            SH
-        );
+        // First strategy: check that refs/remotes/<origin_name>/pull/<pr_id>/head are fetched (and setup)
+
+        $allPROrigins = <<<SH
+        cd '$repoPath';
+        LC_ALL=C.UTF-8 git show-ref | grep -P -- 'refs/remotes/.*/pull/'
+        SH;
+        $allPRsList = shell_exec($allPROrigins);
+
+        // Do they have such refs ?
+        if (trim($allPRsList) !== '') {
+            // If the sha is not found in the output, then fetch all
+            if (! str_contains($allPRsList, $branchShaRef)) {
+                $prOrigins = <<<SH
+                cd '$repoPath';
+                git fetch -q;
+                LC_ALL=C.UTF-8 git show-ref | grep -P -- 'refs/remotes/$prId/pull/'
+                SH;
+                $allPRsList = shell_exec($prOrigins);
+            }
+
+            $separator = "\n";
+            $line = strtok($allPRsList, $separator);
+            while ($line !== false) {
+                # do something with $line
+                $line = strtok($separator);
+                if ($line === false) {
+                    continue;
+                }
+                [$lineRemoteHash, $lineRemoteRef] = explode(" ", $line);
+
+                if ($lineRemoteHash === $branchShaRef && str_contains($lineRemoteRef, '/pull/' . $prId)) {
+                    echo 'Using ' . $lineRemoteRef . ' as the merge ref.' . PHP_EOL;
+                    return $lineRemoteRef;
+                }
+            }
+        }
+
+        // Second strategy: find the remote in the list of remotes
+        $findOriginCommand = <<<SH
+        cd '$repoPath';
+        LC_ALL=C.UTF-8 git remote -v
+        SH;
+        $gitRemoteOriginList = shell_exec($findOriginCommand);
+        $gitRemoteOrigin = null;
+        $separator = "\n";
+        $line = strtok($gitRemoteOriginList, $separator);
+        while ($line !== false) {
+            # do something with $line
+            $line = strtok($separator);
+            if ($line === false) {
+                continue;
+            }
+            [$lineRemoteName, $lineRemoteData] = explode("\t", $line);
+            [$lineRemoteURL, $lineRemoteType] = explode(" ", $lineRemoteData);
+            if ($lineRemoteType !== '(fetch)') {
+                continue;
+            }
+
+            if ($lineRemoteURL === $mergeRemoteUrl || $lineRemoteURL === $mergeRemoteUrl . '.git') {
+                return $lineRemoteName;
+            }
+        }
+
+        // Fallback to finding "origin"
+        if ($gitRemoteOrigin === null) {
+            echo 'Unable to detect ' . $mergeRemoteUrl . ' using the "origin" remote instead ' . PHP_EOL;
+            $gitRemoteOrigin = shell_exec(
+                <<<SH
+                cd '$repoPath';
+                git remote get-url origin;
+                SH
+            );
+        }
 
         // If the origin exists as "origin", then use it
-        if (trim($gitRemoteOrigin) === $remoteUrl) {
+        if ($gitRemoteOrigin === $mergeRemoteUrl || $gitRemoteOrigin === $mergeRemoteUrl . '.git') {
             $remoteName = 'origin';
 
             echo 'Fetching remote ' . $remoteName . PHP_EOL;
@@ -206,20 +321,21 @@ final class ContribMerge {
             return $remoteName;
         }
 
+        // Third strategy: add the remote and fetch it
         $gitRemotes = shell_exec(
             <<<SH
             cd '$repoPath';
             git remote -v;
             SH
         );
-        echo 'Remote (' . $remoteName . '): ' . $remoteUrl . PHP_EOL;
+        echo 'Remote (' . $remoteName . '): ' . $mergeRemoteUrl . PHP_EOL;
 
-        if (! str_contains($gitRemotes, $remoteUrl)) {
+        if (! str_contains($gitRemotes, $mergeRemoteUrl)) {
             echo 'Adding remote ' . $remoteName . PHP_EOL;
             shell_exec(
                 <<<SH
                 cd '$repoPath';
-                git remote add $remoteName $remoteUrl;
+                git remote add $remoteName $mergeRemoteUrl;
                 SH
             );
         }
