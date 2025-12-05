@@ -9,7 +9,17 @@ final class ContribMerge {
     private static string $OWNER = '';
     private static string $REPO = '';
 
-    public static function run(array $options) {
+    /**
+     * @param array{
+     *   pr?: string,
+     *   owner?: string,
+     *   org?: string,
+     *   repo?: string,
+     *   changelog?: mixed,
+     *   merge?: mixed,
+     * } $options
+     */
+    public static function run(array $options): void {
         if (! isset($options['pr']) || empty($options['pr'])) {
             echo 'Use: contrib-merge --pr 123' . PHP_EOL;
             echo 'Use: contrib-merge --pr 123 --changelog' . PHP_EOL;
@@ -67,13 +77,16 @@ final class ContribMerge {
         echo 'Slug: ' . self::$OWNER . '/' . self::$REPO . PHP_EOL;
         $changeLogMode = isset($options['changelog']);
         $mergeMode = isset($options['merge']);
-        $prId = $options['pr'];
+        $prId = (int) $options['pr'];
         match ($changeLogMode) {
             true => self::changeLogPr($prId),
             false => self::mergePr($prId, $mergeMode),
         };
     }
 
+    /**
+     * @return array<mixed,mixed>
+     */
     private static function getIssue(int $issueId): array
     {
         return self::ghAPI(
@@ -102,12 +115,12 @@ final class ContribMerge {
         $links = self::getLinks($prData['body']);
         echo '--Fixes--' . PHP_EOL;
         foreach ($links['fixes'] as $issueId) {
-            $issueData = self::getIssue($issueId);
+            $issueData = self::getIssue((int) $issueId);
             echo '- issue #' . $issueId . ' ' . $issueData['title'] . PHP_EOL;
         }
         echo '--Closes--' . PHP_EOL;
         foreach ($links['closes'] as $issueId) {
-            $issueData = self::getIssue($issueId);
+            $issueData = self::getIssue((int) $issueId);
             echo '- issue #' . $issueId . ' ' . $issueData['title'] . PHP_EOL;
         }
     }
@@ -276,7 +289,6 @@ final class ContribMerge {
         LC_ALL=C.UTF-8 git remote -v
         SH;
         $gitRemoteOriginList = shell_exec($findOriginCommand);
-        $gitRemoteOrigin = null;
         $separator = "\n";
         $line = strtok($gitRemoteOriginList, $separator);
         while ($line !== false) {
@@ -297,15 +309,13 @@ final class ContribMerge {
         }
 
         // Fallback to finding "origin"
-        if ($gitRemoteOrigin === null) {
-            echo 'Unable to detect ' . $mergeRemoteUrl . ' using the "origin" remote instead ' . PHP_EOL;
-            $gitRemoteOrigin = shell_exec(
-                <<<SH
-                cd '$repoPath';
-                git remote get-url origin;
-                SH
-            );
-        }
+        echo 'Unable to detect ' . $mergeRemoteUrl . ' using the "origin" remote instead ' . PHP_EOL;
+        $gitRemoteOrigin = shell_exec(
+            <<<SH
+            cd '$repoPath';
+            git remote get-url origin;
+            SH
+        );
 
         // If the origin exists as "origin", then use it
         if ($gitRemoteOrigin === $mergeRemoteUrl || $gitRemoteOrigin === $mergeRemoteUrl . '.git') {
@@ -349,6 +359,13 @@ final class ContribMerge {
         return $remoteName;
     }
 
+    /**
+     * @return array{
+     * fixes: string[],
+     * closes: string[],
+     * custom: array<string,string[]>,
+     * }
+     */
     private static function getLinks(string $content): array
     {
         $reFixes = '/fixes(?:|:) #(\d+)/mi';
@@ -393,7 +410,7 @@ final class ContribMerge {
         ];
     }
 
-    private static function ghAPI(string $path, string $method = 'GET') {
+    private static function ghAPI(string $path, string $method = 'GET'): mixed {
         $currentDir = getcwd();
         $token = null;
         if ($currentDir && is_dir($currentDir)) {
