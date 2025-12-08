@@ -239,6 +239,7 @@ final class ContribMerge {
     /**
      * @param string $baseRemoteUrl The repo to merge into
      * @param string $mergeRemoteUrl The repo asking for the merge
+     * @return string the reference to merge remote-name/branch-name
      */
     private static function addRemoteIfMissingAndFetch(
         string $baseRemoteUrl, string $mergeRemoteUrl, string $remoteName, string $branchRef, string $branchShaRef, int $prId
@@ -304,12 +305,12 @@ final class ContribMerge {
             }
 
             if ($lineRemoteURL === $mergeRemoteUrl || $lineRemoteURL === $mergeRemoteUrl . '.git') {
-                return $lineRemoteName;
+                return $lineRemoteName . '/' . $branchRef;
             }
         }
 
         // Fallback to finding "origin"
-        echo 'Unable to detect ' . $mergeRemoteUrl . ' using the "origin" remote instead ' . PHP_EOL;
+        //echo 'Unable to detect ' . $mergeRemoteUrl . ' using the "origin" remote instead ' . PHP_EOL;
         $gitRemoteOrigin = shell_exec(
             <<<SH
             cd '$repoPath';
@@ -328,7 +329,7 @@ final class ContribMerge {
                 git fetch $remoteName;
                 SH
             );
-            return $remoteName;
+            return $remoteName . '/' . $branchRef;
         }
 
         // Third strategy: add the remote and fetch it
@@ -356,7 +357,7 @@ final class ContribMerge {
             git fetch $remoteName;
             SH
         );
-        return $remoteName;
+        return $remoteName . '/' . $branchRef;
     }
 
     /**
