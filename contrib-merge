@@ -2,7 +2,7 @@
 <?php
 
 /**
- * @version 1.5.0
+ * @version 1.5.1
  */
 
 final class ContribMerge {
@@ -48,6 +48,17 @@ final class ContribMerge {
                 git remote get-url origin;
                 SH
             );
+
+            // Fallback to using the first origin
+            if (empty($gitRemoteOrigin)) {
+                $gitRemoteOrigin = shell_exec(
+                    <<<SH
+                    cd '$repoPath';
+                    git remote get-url \$(git remote | head -n 1);
+                    SH
+                );
+            }
+
             if (! empty($gitRemoteOrigin)) {
                 $matches = [];
                 $regexGitUrl = '/(?<org>[a-z0-9_-]+)\/(?<repo>[a-z0-9_-]+)(:?\.git$|$)/i';
