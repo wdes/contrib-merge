@@ -304,13 +304,13 @@ final class ContribMerge {
         $separator = "\n";
         $line = strtok($gitRemoteOriginList, $separator);
         while ($line !== false) {
-            # do something with $line
-            $line = strtok($separator);
-            if ($line === false) {
-                continue;
-            }
+            // Read the token first and advance afterwards. Advancing first discarded whichever
+            // remote `git remote -v` lists first, and that is `origin` in the common case of a
+            // repository that has only one — so the remote this is looking for was the one line
+            // never examined, and detection fell through to the fallbacks below every time.
             [$lineRemoteName, $lineRemoteData] = explode("\t", $line);
             [$lineRemoteURL, $lineRemoteType] = explode(" ", $lineRemoteData);
+            $line = strtok($separator);
             if ($lineRemoteType !== '(fetch)') {
                 continue;
             }
@@ -322,12 +322,15 @@ final class ContribMerge {
 
         // Fallback to finding "origin"
         //echo 'Unable to detect ' . $mergeRemoteUrl . ' using the "origin" remote instead ' . PHP_EOL;
-        $gitRemoteOrigin = shell_exec(
+        // `shell_exec` hands back the command's stdout with its trailing newline, so comparing it
+        // as it comes was never equal to the URL — this fallback could not succeed. Trimmed, it is
+        // the plain URL the comparison expects.
+        $gitRemoteOrigin = trim((string) shell_exec(
             <<<SH
             cd '$repoPath';
             git remote get-url origin;
             SH
-        );
+        ));
 
         // If the origin exists as "origin", then use it
         if ($gitRemoteOrigin === $mergeRemoteUrl || $gitRemoteOrigin === $mergeRemoteUrl . '.git') {
@@ -344,15 +347,19 @@ final class ContribMerge {
         }
 
         // Third strategy: add the remote and fetch it
-        $gitRemotes = shell_exec(
-            <<<SH
-            cd '$repoPath';
-            git remote -v;
-            SH
-        );
         echo 'Remote (' . $remoteName . '): ' . $mergeRemoteUrl . PHP_EOL;
 
-        if (! str_contains($gitRemotes, $mergeRemoteUrl)) {
+        // Asked by name, because a name is what the fetch below needs. Searching the URLs in
+        // `git remote -v` answered a different question: when some other remote already carried this
+        // URL — `origin` usually does — the add was skipped and the fetch then asked for a name that
+        // did not exist, which is how this reported a missing repository instead of fetching.
+        $gitRemoteExists = trim((string) shell_exec(
+            <<<SH
+            cd '$repoPath';
+            git remote get-url $remoteName 2>/dev/null;
+            SH
+        )) !== '';
+        if (! $gitRemoteExists) {
             echo 'Adding remote ' . $remoteName . PHP_EOL;
             shell_exec(
                 <<<SH
