@@ -172,6 +172,7 @@ final class ContribMerge {
         $remoteName = $prData['head']['user']['login'];
 
         $mergeRemoteUrl = $prData['head']['repo']['ssh_url'];
+        $mergeRemoteHttpsUrl = $prData['head']['repo']['clone_url'];
         $baseRemoteUrl = $prData['base']['repo']['ssh_url'];
         $branchMergedIntoRef = $prData['base']['ref'];
         $branchRef = $prData['head']['ref'];
@@ -180,6 +181,7 @@ final class ContribMerge {
         $mergeRef = self::addRemoteIfMissingAndFetch(
             $baseRemoteUrl,
             $mergeRemoteUrl,
+            $mergeRemoteHttpsUrl,
             $remoteName,
             $branchRef,
             $branchShaRef,
@@ -250,10 +252,11 @@ final class ContribMerge {
     /**
      * @param string $baseRemoteUrl The repo to merge into
      * @param string $mergeRemoteUrl The repo asking for the merge
+     * @param string $mergeRemoteHttpsUrl The same repo, in its HTTPS form
      * @return string the reference to merge remote-name/branch-name
      */
     private static function addRemoteIfMissingAndFetch(
-        string $baseRemoteUrl, string $mergeRemoteUrl, string $remoteName, string $branchRef, string $branchShaRef, int $prId
+        string $baseRemoteUrl, string $mergeRemoteUrl, string $mergeRemoteHttpsUrl, string $remoteName, string $branchRef, string $branchShaRef, int $prId
     ): string
     {
         $repoPath = getcwd();
@@ -315,7 +318,7 @@ final class ContribMerge {
                 continue;
             }
 
-            if ($lineRemoteURL === $mergeRemoteUrl || $lineRemoteURL === $mergeRemoteUrl . '.git') {
+            if (self::isRepoUrl($lineRemoteURL, $mergeRemoteUrl, $mergeRemoteHttpsUrl)) {
                 return $lineRemoteName . '/' . $branchRef;
             }
         }
@@ -333,7 +336,7 @@ final class ContribMerge {
         ));
 
         // If the origin exists as "origin", then use it
-        if ($gitRemoteOrigin === $mergeRemoteUrl || $gitRemoteOrigin === $mergeRemoteUrl . '.git') {
+        if (self::isRepoUrl($gitRemoteOrigin, $mergeRemoteUrl, $mergeRemoteHttpsUrl)) {
             $remoteName = 'origin';
 
             echo 'Fetching remote ' . $remoteName . PHP_EOL;
@@ -376,6 +379,20 @@ final class ContribMerge {
             SH
         );
         return $remoteName . '/' . $branchRef;
+    }
+
+    /**
+     * Git displays a remote URL after applying the url.<base>.insteadOf rules, so an SSH remote
+     * can show up as its HTTPS form (fetch over HTTPS, push over SSH): both forms are the same repo.
+     */
+    private static function isRepoUrl(string $url, string $sshUrl, string $httpsUrl): bool
+    {
+        foreach ([$sshUrl, $httpsUrl] as $repoUrl) {
+            if ($url === $repoUrl || $url === $repoUrl . '.git') {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
