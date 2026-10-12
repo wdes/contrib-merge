@@ -25,7 +25,7 @@ final class ContribMerge {
             echo 'Use: contrib-merge --pr 123 --changelog' . PHP_EOL;
             echo 'Use: contrib-merge --pr 123 --merge' . PHP_EOL;
             echo 'Use: contrib-merge --pr 1 --owner williamdes --repo test-repo --merge' . PHP_EOL;
-            echo 'Use: contrib-merge --pr 1 --org sudo-bot --repo action-docker-sign --merge' . PHP_EOL;
+            echo 'Use: contrib-merge --pr 1 --org sudo-bot --repo action-doctum --merge' . PHP_EOL;
             exit(1);
         }
 
