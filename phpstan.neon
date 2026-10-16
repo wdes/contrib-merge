@@ -1,0 +1,5 @@
+parameters:
+    # The CI workflow runs the very same command; keep them in step.
+    level: max
+    paths:
+        - contrib-merge
