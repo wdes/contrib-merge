@@ -1,162 +1,1631 @@
 #!/usr/bin/env php
 <?php
 
+declare(strict_types = 1);
+
 /**
- * @version 1.5.2
+ * Merge, changelog and downbase GitHub pull-requests.
+ *
+ * @version 2.0.0
  */
 
-final class ContribMerge {
-    private static string $OWNER = '';
-    private static string $REPO = '';
+/**
+ * Every failure the user is meant to read about. The CLI entry point catches
+ * this once and turns it into an exit code, so no code path calls exit().
+ */
+class ContribMergeException extends RuntimeException
+{
+}
+
+final class ContribMergeUsageException extends ContribMergeException
+{
+}
+
+final class ConsoleOutput
+{
+    /** @var resource */
+    private $stdout;
+
+    /** @var resource */
+    private $stderr;
 
     /**
-     * @param array{
-     *   pr?: string,
-     *   owner?: string,
-     *   org?: string,
-     *   repo?: string,
-     *   changelog?: mixed,
-     *   merge?: mixed,
-     * } $options
+     * @param resource $stdout
+     * @param resource $stderr
      */
-    public static function run(array $options): void {
-        if (! isset($options['pr']) || empty($options['pr'])) {
-            echo 'Use: contrib-merge --pr 123' . PHP_EOL;
-            echo 'Use: contrib-merge --pr 123 --changelog' . PHP_EOL;
-            echo 'Use: contrib-merge --pr 123 --merge' . PHP_EOL;
-            echo 'Use: contrib-merge --pr 1 --owner williamdes --repo test-repo --merge' . PHP_EOL;
-            echo 'Use: contrib-merge --pr 1 --org sudo-bot --repo action-doctum --merge' . PHP_EOL;
-            exit(1);
+    public function __construct($stdout, $stderr)
+    {
+        $this->stdout = $stdout;
+        $this->stderr = $stderr;
+    }
+
+    public static function create(): self
+    {
+        return new self(STDOUT, STDERR);
+    }
+
+    public function line(string $message = ''): void
+    {
+        fwrite($this->stdout, $message . PHP_EOL);
+    }
+
+    public function error(string $message): void
+    {
+        fwrite($this->stderr, $message . PHP_EOL);
+    }
+}
+
+final class ProcessResult
+{
+    /**
+     * @param string[] $command
+     */
+    public function __construct(
+        public readonly array $command,
+        public readonly int $exitCode,
+        public readonly string $stdout,
+        public readonly string $stderr,
+    ) {
+    }
+
+    public function isOk(): bool
+    {
+        return $this->exitCode === 0;
+    }
+
+    public function commandLine(): string
+    {
+        return implode(' ', array_map(
+            static fn (string $argument): string => preg_match('/^[A-Za-z0-9_@%+=:,.\/-]+$/', $argument) === 1
+                ? $argument
+                : escapeshellarg($argument),
+            $this->command
+        ));
+    }
+
+    public function failureDetails(): string
+    {
+        $details = 'Command failed with exit code ' . $this->exitCode . ':' . PHP_EOL . $this->commandLine();
+        $stderr = trim($this->stderr);
+        $stdout = trim($this->stdout);
+        if ($stderr !== '') {
+            $details .= PHP_EOL . $stderr;
+        } elseif ($stdout !== '') {
+            $details .= PHP_EOL . $stdout;
         }
 
-        if (isset($options['owner']) && ! empty($options['owner'])) {
-            self::$OWNER = $options['owner'];
+        return $details;
+    }
+}
+
+interface ProcessRunner
+{
+    /**
+     * Run a command without a shell: the arguments are passed as an argv array,
+     * so no branch name, path or URL can ever be interpreted by a shell.
+     *
+     * @param string[] $command
+     */
+    public function run(array $command, ?string $cwd = null): ProcessResult;
+}
+
+final class SystemProcessRunner implements ProcessRunner
+{
+    public function run(array $command, ?string $cwd = null): ProcessResult
+    {
+        if ($command === []) {
+            throw new ContribMergeException('Refusing to run an empty command');
         }
-        if (isset($options['org']) && ! empty($options['org'])) {
-            self::$OWNER = $options['org'];
-        }
-        if (isset($options['repo']) && ! empty($options['repo'])) {
-            self::$REPO = $options['repo'];
+        // proc_open wants a list: a caller's array with gaps would silently
+        // lose its keys to the child process.
+        $command = array_values($command);
+
+        $descriptors = [
+            0 => ['file', '/dev/null', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ];
+
+        // An explicit environment, so the LC_ALL below is the one git sees.
+        $environment = getenv();
+        // Git messages and ref output are parsed, so they must not be translated.
+        $environment['LC_ALL'] = 'C.UTF-8';
+
+        $process = proc_open($command, $descriptors, $pipes, $cwd, $environment);
+        if ($process === false) {
+            throw new ContribMergeException('Unable to start: ' . implode(' ', $command));
         }
 
-        // Try to auto detect
-        if (empty(self::$OWNER) && empty(self::$REPO)) {
-            $repoPath = getcwd();
-            $gitRemoteOrigin = shell_exec(
-                <<<SH
-                cd '$repoPath';
-                git remote get-url origin;
-                SH
-            );
+        $streams = [];
+        $buffers = ['out' => '', 'err' => ''];
+        if (isset($pipes[1]) && is_resource($pipes[1])) {
+            $streams['out'] = $pipes[1];
+            stream_set_blocking($pipes[1], false);
+        }
+        if (isset($pipes[2]) && is_resource($pipes[2])) {
+            $streams['err'] = $pipes[2];
+            stream_set_blocking($pipes[2], false);
+        }
 
-            // Fallback to using the first origin
-            if (empty($gitRemoteOrigin)) {
-                $gitRemoteOrigin = shell_exec(
-                    <<<SH
-                    cd '$repoPath';
-                    git remote get-url \$(git remote | head -n 1);
-                    SH
-                );
+        // Both pipes are drained as they fill: reading one to EOF before the
+        // other deadlocks as soon as the second one holds more than the pipe
+        // buffer, which `composer install` does easily.
+        while ($streams !== []) {
+            $read = array_values($streams);
+            $write = null;
+            $except = null;
+            $ready = stream_select($read, $write, $except, 30);
+            if ($ready === false) {
+                break;
+            }
+            foreach ($read as $stream) {
+                $name = array_search($stream, $streams, true);
+                if (! is_string($name)) {
+                    continue;
+                }
+                $chunk = fread($stream, 65536);
+                if ($chunk === false) {
+                    fclose($stream);
+                    unset($streams[$name]);
+                    continue;
+                }
+                if ($chunk === '' && feof($stream)) {
+                    fclose($stream);
+                    unset($streams[$name]);
+                    continue;
+                }
+                $buffers[$name] .= $chunk;
+            }
+        }
+
+        $exitCode = proc_close($process);
+
+        return new ProcessResult($command, $exitCode, $buffers['out'], $buffers['err']);
+    }
+}
+
+final class ExecutableFinder
+{
+    /**
+     * Resolve a binary on PATH. `composer-php7.2` and friends are wrappers that
+     * only exist as files in a PATH directory, so the lookup is a pure PATH
+     * scan -- no shell, nothing to quote.
+     */
+    public static function find(string $binary): ?string
+    {
+        $path = getenv('PATH');
+        if (! is_string($path) || $path === '') {
+            return null;
+        }
+
+        foreach (explode(PATH_SEPARATOR, $path) as $directory) {
+            if ($directory === '') {
+                continue;
+            }
+            $candidate = rtrim($directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $binary;
+            if (is_file($candidate) && is_executable($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+}
+
+/**
+ * Names that end up as git arguments are validated first: a value starting with
+ * a dash, or carrying `..` / `@{` / `//`, is a ref git rejects anyway and a
+ * value git could read as an option is worse than a clear refusal.
+ */
+final class GitRefName
+{
+    public static function assertValidBranch(string $name): void
+    {
+        if ($name === ''
+            || preg_match('#^[A-Za-z0-9][A-Za-z0-9._/-]*$#', $name) !== 1
+            || str_contains($name, '..')
+            || str_contains($name, '@{')
+            || str_contains($name, '//')
+            || str_ends_with($name, '/')
+            || str_ends_with($name, '.')
+            || str_ends_with($name, '.lock')
+        ) {
+            throw new ContribMergeException('Refusing to use "' . $name . '" as a branch name.');
+        }
+    }
+
+    public static function assertValidRemote(string $name): void
+    {
+        if ($name === ''
+            || preg_match('#^[A-Za-z0-9][A-Za-z0-9._-]*$#', $name) !== 1
+            || str_ends_with($name, '.')
+        ) {
+            throw new ContribMergeException('Refusing to use "' . $name . '" as a remote name.');
+        }
+    }
+}
+
+final class RepositorySlug
+{
+    public function __construct(
+        public readonly string $owner,
+        public readonly string $repository,
+    ) {
+    }
+
+    public function __toString(): string
+    {
+        return $this->owner . '/' . $this->repository;
+    }
+
+    /**
+     * Read `owner/repository` out of a remote URL: ssh, the scp-like
+     * `git@host:owner/repo` form, or https.
+     */
+    public static function fromRemoteUrl(string $url): ?self
+    {
+        $url = trim($url);
+        if ($url === '') {
+            return null;
+        }
+
+        $patterns = [
+            '#^[a-z][a-z0-9+.-]*://(?:[^/@]+@)?[^/]+/(?<path>.+?)/?$#i',
+            '#^(?:[^@/]+@)?[^/:]+:(?<path>.+?)/?$#',
+        ];
+
+        foreach ($patterns as $pattern) {
+            $matches = [];
+            if (preg_match($pattern, $url, $matches) !== 1) {
+                continue;
+            }
+            $path = (string) preg_replace('/\.git$/', '', trim($matches['path'], '/'));
+            $parts = explode('/', $path);
+            if (count($parts) < 2) {
+                continue;
+            }
+            $repository = array_pop($parts);
+            $owner = array_pop($parts);
+            if ($owner === '' || $repository === '') {
+                continue;
             }
 
-            if (! empty($gitRemoteOrigin)) {
-                $matches = [];
-                $regexGitUrl = '/(?<org>[a-z0-9_-]+)\/(?<repo>[a-z0-9_-]+)(:?\.git$|$)/i';
-                preg_match_all($regexGitUrl, $gitRemoteOrigin, $matches);
+            return new self($owner, $repository);
+        }
 
-                self::$OWNER = $matches['org'][0] ?? '';
-                self::$REPO = $matches['repo'][0] ?? '';
-                if (empty(self::$OWNER) || empty(self::$REPO)) {
-                    echo 'Unable to auto detect the slug from remote URL: ' . $gitRemoteOrigin . PHP_EOL;
-                } else {
-                    echo '--Auto detected settings--' . PHP_EOL;
-                    echo 'Owner/org: ' . self::$OWNER . PHP_EOL;
-                    echo 'Repo: ' . self::$REPO . PHP_EOL;
-                    echo '--Auto detected settings--' . PHP_EOL;
+        return null;
+    }
+}
+
+final class RemoteTarget
+{
+    /**
+     * @param string $remote the remote name, usable for a push
+     * @param string $ref    the fetched ref, usable for an add/reset/cherry-pick
+     */
+    public function __construct(
+        public readonly string $remote,
+        public readonly string $ref,
+    ) {
+    }
+}
+
+final class Issue
+{
+    public function __construct(
+        public readonly int $number,
+        public readonly string $title,
+    ) {
+    }
+
+    /**
+     * @param array<mixed, mixed> $data
+     */
+    public static function fromApi(array $data, int $number): self
+    {
+        $title = $data['title'] ?? null;
+
+        return new self($number, is_string($title) ? $title : '');
+    }
+}
+
+final class PullRequest
+{
+    public function __construct(
+        public readonly int $number,
+        public readonly string $title,
+        public readonly string $body,
+        public readonly bool $merged,
+        public readonly string $authorAssociation,
+        public readonly int $commitsCount,
+        public readonly int $additions,
+        public readonly int $deletions,
+        public readonly int $changedFiles,
+        public readonly bool $maintainerCanModify,
+        public readonly string $baseRef,
+        public readonly string $baseRepository,
+        public readonly string $baseSshUrl,
+        public readonly string $headRef,
+        public readonly string $headSha,
+        public readonly string $headUserName,
+        public readonly string $headRepository,
+        public readonly string $headSshUrl,
+        public readonly string $headCloneUrl,
+    ) {
+    }
+
+    public function isFromFork(): bool
+    {
+        return $this->headRepository !== '' && $this->headRepository !== $this->baseRepository;
+    }
+
+    /**
+     * @param array<mixed, mixed> $data
+     */
+    public static function fromApi(array $data, int $number): self
+    {
+        return new self(
+            number: $number,
+            title: self::stringAt($data, ['title']),
+            body: self::stringAt($data, ['body']),
+            merged: ($data['merged'] ?? false) === true,
+            authorAssociation: self::stringAt($data, ['author_association']),
+            commitsCount: self::intAt($data, ['commits']),
+            additions: self::intAt($data, ['additions']),
+            deletions: self::intAt($data, ['deletions']),
+            changedFiles: self::intAt($data, ['changed_files']),
+            maintainerCanModify: ($data['maintainer_can_modify'] ?? false) === true,
+            baseRef: self::stringAt($data, ['base', 'ref']),
+            baseRepository: self::stringAt($data, ['base', 'repo', 'full_name']),
+            baseSshUrl: self::stringAt($data, ['base', 'repo', 'ssh_url']),
+            headRef: self::stringAt($data, ['head', 'ref']),
+            headSha: self::stringAt($data, ['head', 'sha']),
+            headUserName: self::stringAt($data, ['head', 'user', 'login']),
+            headRepository: self::stringAt($data, ['head', 'repo', 'full_name']),
+            headSshUrl: self::stringAt($data, ['head', 'repo', 'ssh_url']),
+            headCloneUrl: self::stringAt($data, ['head', 'repo', 'clone_url']),
+        );
+    }
+
+    /**
+     * @param array<mixed, mixed> $data
+     * @param string[]            $keys
+     */
+    private static function stringAt(array $data, array $keys): string
+    {
+        $value = $data;
+        foreach ($keys as $key) {
+            if (! is_array($value) || ! array_key_exists($key, $value)) {
+                return '';
+            }
+            $value = $value[$key];
+        }
+
+        return is_string($value) ? $value : '';
+    }
+
+    /**
+     * @param array<mixed, mixed> $data
+     * @param string[]            $keys
+     */
+    private static function intAt(array $data, array $keys): int
+    {
+        $value = $data;
+        foreach ($keys as $key) {
+            if (! is_array($value) || ! array_key_exists($key, $value)) {
+                return 0;
+            }
+            $value = $value[$key];
+        }
+
+        return is_int($value) ? $value : 0;
+    }
+}
+
+final class PullRequestLinks
+{
+    /**
+     * @return array{fixes: string[], closes: string[], custom: array<string, string[]>}
+     */
+    public static function extract(string $content, string $customPattern = ''): array
+    {
+        $matchesFixes = [];
+        preg_match_all('/fixes(?:|:) #(\d+)/mi', $content, $matchesFixes, PREG_PATTERN_ORDER);
+
+        $matchesCloses = [];
+        preg_match_all('/closes(?:|:) #(\d+)/mi', $content, $matchesCloses, PREG_PATTERN_ORDER);
+
+        $custom = [];
+        if (trim($customPattern) !== '') {
+            if (! self::isValidPattern($customPattern)) {
+                throw new ContribMergeException(
+                    'The git config contrib-merge.format value is not a valid regular expression: ' . $customPattern
+                );
+            }
+            $matches = [];
+            preg_match_all($customPattern, $content, $matches, PREG_SET_ORDER);
+            foreach ($matches as $match) {
+                foreach ($match as $groupName => $groupValue) {
+                    if (! is_string($groupName)) {
+                        continue;
+                    }
+                    if (! isset($custom[$groupName])) {
+                        $custom[$groupName] = [];
+                    }
+                    $custom[$groupName][] = trim($groupValue);
                 }
             }
         }
 
+        // Both patterns carry one group, so preg_match_all always sets offset
+        // 1, an empty list when nothing matched.
+        $fixes = array_values(array_filter($matchesFixes[1], 'is_string'));
+        $closes = array_values(array_filter($matchesCloses[1], 'is_string'));
 
-        if (empty(self::$OWNER) || empty(self::$REPO)) {
-            echo 'Missing repo or owner/org' . PHP_EOL;
-            echo 'Owner/org: ' . self::$OWNER . PHP_EOL;
-            echo 'Repo: ' . self::$REPO . PHP_EOL;
-            exit(1);
+        return [
+            'fixes' => $fixes,
+            'closes' => $closes,
+            'custom' => $custom,
+        ];
+    }
+
+    private static function isValidPattern(string $pattern): bool
+    {
+        $failed = false;
+        set_error_handler(static function () use (&$failed): bool {
+            $failed = true;
+
+            return true;
+        });
+        try {
+            $result = preg_match($pattern, '');
+        } finally {
+            restore_error_handler();
         }
 
-        echo 'Slug: ' . self::$OWNER . '/' . self::$REPO . PHP_EOL;
-        $changeLogMode = isset($options['changelog']);
-        $mergeMode = isset($options['merge']);
-        $prId = (int) $options['pr'];
-        match ($changeLogMode) {
-            true => self::changeLogPr($prId),
-            false => self::mergePr($prId, $mergeMode),
-        };
+        return $failed === false && $result !== false;
+    }
+}
+
+final class PhpVersionConstraint
+{
+    /**
+     * The lowest PHP version a composer constraint accepts, as `major.minor`:
+     * `^7.2 || ^8.0` gives `7.2`, which names the `composer-php7.2` wrapper.
+     * Upper bounds are ignored, and a constraint with no lower bound (`*`)
+     * returns null rather than guessing.
+     */
+    public static function minimum(string $constraint): ?string
+    {
+        $minimum = null;
+
+        foreach (preg_split('/\|\||,|\s+/', $constraint) ?: [] as $part) {
+            $matches = [];
+            if (preg_match('/^(?:\^|~|>=|>|=|v)?(?<version>\d+(?:\.\d+){0,2})(?:\.\*)?$/', trim($part), $matches) !== 1) {
+                continue;
+            }
+            $version = $matches['version'];
+            $normalized = self::majorMinor($version);
+            if ($normalized === null) {
+                continue;
+            }
+            if ($minimum === null || version_compare($normalized, $minimum, '<')) {
+                $minimum = $normalized;
+            }
+        }
+
+        return $minimum;
+    }
+
+    private static function majorMinor(string $version): ?string
+    {
+        $parts = explode('.', $version);
+        if (! ctype_digit($parts[0])) {
+            return null;
+        }
+        $major = $parts[0];
+        $minor = $parts[1] ?? '0';
+        if (! ctype_digit($minor)) {
+            return null;
+        }
+
+        return $major . '.' . $minor;
+    }
+}
+
+final class HttpResponse
+{
+    public function __construct(
+        public readonly int $status,
+        public readonly string $body,
+    ) {
+    }
+}
+
+interface HttpTransport
+{
+    /**
+     * @param array<string, string> $headers
+     */
+    public function send(string $method, string $url, array $headers, ?string $body = null): HttpResponse;
+}
+
+final class CurlHttpTransport implements HttpTransport
+{
+    public function send(string $method, string $url, array $headers, ?string $body = null): HttpResponse
+    {
+        $curl = curl_init();
+        if ($curl === false) {
+            throw new ContribMergeException('Unable to initialize cURL');
+        }
+        if ($url === '' || $method === '') {
+            throw new ContribMergeException('Refusing to send a request without a URL or a method');
+        }
+
+        $headerLines = [];
+        foreach ($headers as $name => $value) {
+            $headerLines[] = $name . ': ' . $value;
+        }
+
+        curl_setopt($curl, CURLOPT_URL, $url);
+        curl_setopt($curl, CURLOPT_CUSTOMREQUEST, $method);
+        curl_setopt($curl, CURLOPT_HTTPHEADER, $headerLines);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_TIMEOUT, 120);
+        if ($body !== null) {
+            curl_setopt($curl, CURLOPT_POSTFIELDS, $body);
+        }
+
+        $responseBody = curl_exec($curl);
+        $errorNumber = curl_errno($curl);
+        $errorMessage = curl_strerror($errorNumber);
+        $status = (int) curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+
+        if ($responseBody === false || $errorNumber !== 0) {
+            throw new ContribMergeException(sprintf(
+                'cURL error (%d: %s) for url %s',
+                $errorNumber,
+                (string) $errorMessage,
+                $url
+            ));
+        }
+
+        return new HttpResponse($status, (string) $responseBody);
+    }
+}
+
+final class GitHubClient
+{
+    public function __construct(
+        private HttpTransport $transport,
+        private RepositorySlug $slug,
+        private ?string $token = null,
+    ) {
+    }
+
+    public function slug(): RepositorySlug
+    {
+        return $this->slug;
+    }
+
+    public function pullRequest(int $id): PullRequest
+    {
+        return PullRequest::fromApi($this->get('/repos/' . $this->slug . '/pulls/' . $id), $id);
+    }
+
+    public function issue(int $id): Issue
+    {
+        return Issue::fromApi($this->get('/repos/' . $this->slug . '/issues/' . $id), $id);
     }
 
     /**
-     * @return array<mixed,mixed>
+     * The pull-request's own commits, oldest first. Read from the API rather
+     * than from a local `lower..head` range: a contributor who branched off
+     * master would drag every master-only commit into that range.
+     *
+     * @return string[]
      */
-    private static function getIssue(int $issueId): array
+    public function pullRequestCommitShas(int $id): array
     {
-        return self::ghAPI(
-            sprintf(
-                '/repos/%s/%s/issues/%s',
-                self::$OWNER,
-                self::$REPO,
-                $issueId
-            )
-        );
+        $data = $this->get('/repos/' . $this->slug . '/pulls/' . $id . '/commits?per_page=250');
 
+        $shas = [];
+        foreach ($data as $commit) {
+            if (! is_array($commit)) {
+                continue;
+            }
+            $sha = $commit['sha'] ?? null;
+            if (is_string($sha) && $sha !== '') {
+                $shas[] = $sha;
+            }
+        }
+
+        return $shas;
     }
 
-    private static function changeLogPr(int $prId): void
+    public function updatePullRequestBase(int $id, string $base): void
     {
-        $prData = self::ghAPI(
-            sprintf(
-                '/repos/%s/%s/pulls/%s',
-                self::$OWNER,
-                self::$REPO,
-                $prId
-            )
-        );
+        $this->patch('/repos/' . $this->slug . '/pulls/' . $id, ['base' => $base]);
+    }
 
-        echo 'Title: ' . $prData['title'] . PHP_EOL;
-        $links = self::getLinks($prData['body']);
-        echo '--Fixes--' . PHP_EOL;
+    /**
+     * @return array<mixed, mixed>
+     */
+    private function get(string $path): array
+    {
+        return $this->request('GET', $path, null);
+    }
+
+    /**
+     * @param array<mixed, mixed> $payload
+     *
+     * @return array<mixed, mixed>
+     */
+    private function patch(string $path, array $payload): array
+    {
+        return $this->request('PATCH', $path, $payload);
+    }
+
+    /**
+     * @param array<mixed, mixed>|null $payload
+     *
+     * @return array<mixed, mixed>
+     */
+    private function request(string $method, string $path, ?array $payload): array
+    {
+        $headers = [
+            // GitHub rejects any request without a User-Agent with a bare 403,
+            // so this header is not optional.
+            'User-Agent' => 'contrib-merge',
+            'Accept' => 'application/vnd.github+json',
+            'X-GitHub-Api-Version' => '2022-11-28',
+        ];
+        if ($this->token !== null && $this->token !== '') {
+            $headers['Authorization'] = 'Bearer ' . $this->token;
+        }
+
+        $body = null;
+        if ($payload !== null) {
+            $encoded = json_encode($payload);
+            if ($encoded === false) {
+                throw new ContribMergeException('Unable to encode the request payload for ' . $path);
+            }
+            $body = $encoded;
+        }
+
+        $response = $this->transport->send($method, 'https://api.github.com' . $path, $headers, $body);
+        $decoded = json_decode($response->body, true);
+        if (! is_array($decoded)) {
+            $decoded = [];
+        }
+
+        if ($response->status < 200 || $response->status >= 300) {
+            $message = $decoded['message'] ?? null;
+            $documentationUrl = $decoded['documentation_url'] ?? null;
+            throw new ContribMergeException(sprintf(
+                '%s %s failed with HTTP %d: %s%s',
+                $method,
+                $path,
+                $response->status,
+                is_string($message) ? $message : '(no message)',
+                is_string($documentationUrl) ? PHP_EOL . $documentationUrl : ''
+            ));
+        }
+
+        return $decoded;
+    }
+}
+
+final class GitHubTokenResolver
+{
+    /**
+     * A token is optional (the REST API allows anonymous reads), but the
+     * header is never printed: it used to be dumped together with the request
+     * headers whenever GitHub answered with an error.
+     */
+    public static function resolve(GitRepository $git, ConsoleOutput $output): ?string
+    {
+        $configured = trim($git->configValue('github.token'));
+        if ($configured !== '') {
+            $output->line('Using the token from the GitHub local config at: ' . $git->path());
+
+            return $configured;
+        }
+
+        foreach (['GITHUB_TOKEN', 'GH_TOKEN'] as $name) {
+            $value = getenv($name);
+            if (is_string($value) && trim($value) !== '') {
+                $output->line('Using the token from the ' . $name . ' environment variable');
+
+                return trim($value);
+            }
+        }
+
+        return null;
+    }
+}
+
+final class GitRepository
+{
+    public function __construct(
+        private ProcessRunner $process,
+        private string $path,
+    ) {
+    }
+
+    public function path(): string
+    {
+        return $this->path;
+    }
+
+    /**
+     * Bind to another directory of the same repository: a worktree shares the
+     * refs and the config, so the same object can drive both.
+     */
+    public function inPath(string $path): self
+    {
+        return new self($this->process, $path);
+    }
+
+    /**
+     * @param string[] $arguments
+     */
+    public function run(array $arguments): ProcessResult
+    {
+        return $this->process->run(
+            array_merge(
+                [
+                    'env',
+                    'LC_ALL=C.UTF-8',
+                    'git',
+                    // No editor can ever be asked to open: every commit-ish
+                    // command reuses the message it already has.
+                    '-c',
+                    'core.editor=true',
+                    // Non-ASCII paths come back raw instead of octal-escaped.
+                    '-c',
+                    'core.quotepath=false',
+                ],
+                $arguments
+            ),
+            $this->path
+        );
+    }
+
+    /**
+     * @param string[] $arguments
+     */
+    public function mustRun(array $arguments): string
+    {
+        $result = $this->run($arguments);
+        if (! $result->isOk()) {
+            throw new ContribMergeException($result->failureDetails());
+        }
+
+        return $result->stdout;
+    }
+
+    public function configValue(string $key): string
+    {
+        // An unset key is an expected outcome here, not a failure.
+        return trim($this->run(['config', $key])->stdout);
+    }
+
+    public function signoffRequired(): bool
+    {
+        return $this->configValue('format.signoff') !== 'false';
+    }
+
+    public function currentBranch(): string
+    {
+        return trim($this->mustRun(['branch', '--show-current']));
+    }
+
+    public function isClean(): bool
+    {
+        return trim($this->mustRun(['status', '--porcelain'])) === '';
+    }
+
+    public function statusPorcelain(): string
+    {
+        return trim($this->mustRun(['status', '--porcelain']));
+    }
+
+    public function revisionExists(string $ref): bool
+    {
+        return $this->run(['rev-parse', '--verify', '--quiet', $ref . '^{commit}'])->isOk();
+    }
+
+    public function revision(string $ref): ?string
+    {
+        $result = $this->run(['rev-parse', '--verify', '--quiet', $ref . '^{commit}']);
+        if (! $result->isOk()) {
+            return null;
+        }
+
+        return trim($result->stdout);
+    }
+
+    public function remoteUrl(string $name): ?string
+    {
+        $result = $this->run(['remote', 'get-url', $name]);
+        if (! $result->isOk()) {
+            return null;
+        }
+
+        return trim($result->stdout);
+    }
+
+    /**
+     * @return list<array{name: string, url: string}>
+     */
+    public function remotes(): array
+    {
+        $remotes = [];
+        foreach (explode("\n", $this->mustRun(['remote', '-v'])) as $line) {
+            $parts = explode("\t", $line);
+            if (count($parts) !== 2) {
+                continue;
+            }
+            $matches = [];
+            if (preg_match('/^(?<url>\S+)\s+\(fetch\)$/', $parts[1], $matches) !== 1) {
+                continue;
+            }
+            $remotes[] = ['name' => $parts[0], 'url' => $matches['url']];
+        }
+
+        return $remotes;
+    }
+
+    public function detectBaseRepositoryUrl(): ?string
+    {
+        $origin = $this->remoteUrl('origin');
+        if ($origin !== null && $origin !== '') {
+            return $origin;
+        }
+
+        $remotes = $this->remotes();
+
+        return $remotes === [] ? null : $remotes[0]['url'];
+    }
+
+    public function addRemote(string $name, string $url): void
+    {
+        GitRefName::assertValidRemote($name);
+        $this->mustRun(['remote', 'add', $name, $url]);
+    }
+
+    /**
+     * @param string[] $refSpecs
+     */
+    public function fetch(string $remote, array $refSpecs = []): void
+    {
+        $arguments = ['fetch', '--quiet', $remote];
+        foreach ($refSpecs as $refSpec) {
+            $arguments[] = $refSpec;
+        }
+        $this->mustRun($arguments);
+    }
+
+    public function pruneWorktrees(): void
+    {
+        $this->run(['worktree', 'prune']);
+    }
+
+    public function addWorktree(string $path, string $ref): void
+    {
+        $this->mustRun(['worktree', 'add', '--detach', $path, $ref]);
+    }
+
+    public function removeWorktree(string $path): void
+    {
+        $this->mustRun(['worktree', 'remove', '--force', $path]);
+    }
+
+    public function resetHard(string $ref): void
+    {
+        $this->mustRun(['reset', '--hard', $ref]);
+    }
+
+    public function cherryPick(string $sha): ProcessResult
+    {
+        return $this->run(['cherry-pick', $sha]);
+    }
+
+    public function cherryPickAbort(): void
+    {
+        $this->run(['cherry-pick', '--abort']);
+    }
+
+    public function cherryPickContinue(): ProcessResult
+    {
+        return $this->run(['cherry-pick', '--continue']);
+    }
+
+    public function cherryPickSkip(): ProcessResult
+    {
+        return $this->run(['cherry-pick', '--skip']);
+    }
+
+    /**
+     * @return string[]
+     */
+    public function conflictedFiles(): array
+    {
+        $result = $this->run(['diff', '--name-only', '--diff-filter=U', '-z']);
+        if (! $result->isOk()) {
+            return [];
+        }
+
+        return array_values(array_filter(explode("\0", $result->stdout), static fn (string $file): bool => $file !== ''));
+    }
+
+    /**
+     * @param string[] $files
+     */
+    public function checkoutTheirs(array $files): void
+    {
+        $this->mustRun(array_merge(['checkout', '--theirs', '--'], $files));
+    }
+
+    /**
+     * @param string[] $files
+     */
+    public function stage(array $files): void
+    {
+        $this->mustRun(array_merge(['add', '--'], $files));
+    }
+
+    public function stageAll(): void
+    {
+        $this->mustRun(['add', '-A']);
+    }
+
+    public function commitSubject(string $sha): string
+    {
+        return trim($this->run(['log', '-1', '--format=%s', $sha])->stdout);
+    }
+
+    public function shortSha(string $sha): string
+    {
+        return substr($sha, 0, 7);
+    }
+
+    public function commit(string $message, bool $signoff): void
+    {
+        $arguments = ['commit', '-m', $message];
+        if ($signoff) {
+            $arguments[] = '--signoff';
+        }
+        $this->mustRun($arguments);
+    }
+
+    public function diffStat(string $from, string $to): string
+    {
+        return trim($this->mustRun(['diff', '--stat', $from, $to]));
+    }
+
+    public function merge(string $ref, string $message, bool $signoff): ProcessResult
+    {
+        $arguments = ['merge', $ref, '--no-ff', '-m', $message];
+        if ($signoff) {
+            $arguments[] = '--signoff';
+        }
+
+        return $this->run($arguments);
+    }
+
+    /**
+     * Force-push the current HEAD, but only while the remote branch still
+     * holds the revision we based the work on: a branch that moved under us
+     * fails the lease instead of losing the new commits.
+     */
+    public function pushWithLease(string $remote, string $remoteBranch, string $expectedSha): ProcessResult
+    {
+        GitRefName::assertValidBranch($remoteBranch);
+        GitRefName::assertValidRemote($remote);
+
+        return $this->run([
+            'push',
+            '--force-with-lease=refs/heads/' . $remoteBranch . ':' . $expectedSha,
+            $remote,
+            'HEAD:refs/heads/' . $remoteBranch,
+        ]);
+    }
+
+    public function pushCommandLine(string $remote, string $remoteBranch, string $expectedSha): string
+    {
+        return (new ProcessResult(
+            [
+                'git',
+                'push',
+                '--force-with-lease=refs/heads/' . $remoteBranch . ':' . $expectedSha,
+                $remote,
+                'HEAD:refs/heads/' . $remoteBranch,
+            ],
+            0,
+            '',
+            ''
+        ))->commandLine();
+    }
+}
+
+final class BaselineRegenerator
+{
+    public function __construct(
+        private ProcessRunner $process,
+        private ConsoleOutput $output,
+    ) {
+    }
+
+    /**
+     * Regenerate the analysis baselines that were dropped while replaying the
+     * commits, using the PHP version the branch itself declares.
+     *
+     * @param string[] $baselineFiles
+     */
+    public function regenerate(GitRepository $worktree, string $lowerBranch, array $baselineFiles): void
+    {
+        $path = $worktree->path();
+        $composerJson = $path . '/composer.json';
+        $contents = is_file($composerJson) ? file_get_contents($composerJson) : false;
+        if ($contents === false) {
+            throw new ContribMergeException(
+                'No readable composer.json on ' . $lowerBranch . ': ' . implode(', ', $baselineFiles)
+                . ' must be regenerated by hand.'
+            );
+        }
+
+        $composer = json_decode($contents, true);
+        $scripts = is_array($composer) ? ($composer['scripts'] ?? null) : null;
+        if (! is_array($scripts) || ! array_key_exists('update:baselines', $scripts)) {
+            throw new ContribMergeException(
+                'composer.json defines no update:baselines script: ' . implode(', ', $baselineFiles)
+                . ' must be regenerated by hand.'
+            );
+        }
+
+        $require = $composer['require'] ?? null;
+        $requirement = is_array($require) ? ($require['php'] ?? null) : null;
+        $minimumVersion = is_string($requirement) ? PhpVersionConstraint::minimum($requirement) : null;
+        if ($minimumVersion === null) {
+            throw new ContribMergeException(
+                'Unable to read the minimum PHP version from the composer.json requirement: '
+                . implode(', ', $baselineFiles) . ' must be regenerated by hand.'
+            );
+        }
+
+        $composerBinary = 'composer-php' . $minimumVersion;
+        if (ExecutableFinder::find($composerBinary) === null) {
+            throw new ContribMergeException(
+                $composerBinary . ' was not found on PATH: ' . implode(', ', $baselineFiles)
+                . ' must be regenerated by hand with PHP ' . $minimumVersion . '.'
+            );
+        }
+
+        if (! is_dir($path . '/vendor')) {
+            $this->output->line('Installing the dependencies with ' . $composerBinary . ' (no vendor directory yet)');
+            $this->runOrFail([$composerBinary, 'install', '--no-interaction', '--no-progress'], $path);
+        }
+
+        $this->output->line('Regenerating the baselines with ' . $composerBinary);
+        $this->runOrFail([$composerBinary, 'run', 'update:baselines'], $path);
+
+        $status = $worktree->statusPorcelain();
+        if ($status === '') {
+            $this->output->line('The regenerated baselines are identical, nothing to commit');
+
+            return;
+        }
+
+        foreach (explode("\n", $status) as $entry) {
+            $this->output->line('  ' . ltrim(substr($entry, 2)));
+        }
+
+        $worktree->stageAll();
+        $worktree->commit(
+            "Regenerate the baselines\n\n"
+            . 'Replayed onto ' . $lowerBranch . ', which conflicted on '
+            . implode(', ', $baselineFiles) . '; regenerated with `' . $composerBinary . ' run update:baselines`.',
+            $worktree->signoffRequired()
+        );
+    }
+
+    /**
+     * @param string[] $command
+     */
+    private function runOrFail(array $command, string $cwd): void
+    {
+        $result = $this->process->run($command, $cwd);
+        $stdout = trim($result->stdout);
+        if ($stdout !== '') {
+            $this->output->line($stdout);
+        }
+        if (! $result->isOk()) {
+            throw new ContribMergeException($result->failureDetails());
+        }
+    }
+}
+
+final class Options
+{
+    /**
+     * @var string[]
+     */
+    public const LONG_OPTIONS = ['pr:', 'changelog', 'merge', 'owner:', 'org:', 'repo:', 'downbase:', 'dry-run'];
+
+    public function __construct(
+        public readonly int $pr,
+        public readonly ?string $owner,
+        public readonly ?string $repository,
+        public readonly bool $changeLog,
+        public readonly bool $merge,
+        public readonly ?string $downBase,
+        public readonly bool $dryRun,
+    ) {
+    }
+
+    /**
+     * @param array<string, mixed> $raw
+     */
+    public static function fromGetoptArray(array $raw): self
+    {
+        $pr = $raw['pr'] ?? null;
+        if (! is_string($pr) || preg_match('/^\d+$/', $pr) !== 1 || (int) $pr < 1) {
+            throw new ContribMergeUsageException('Missing a usable pull-request number, for example: --pr 123');
+        }
+
+        $owner = self::optionString($raw, 'org') ?? self::optionString($raw, 'owner');
+        $downBase = self::optionString($raw, 'downbase');
+        $dryRun = array_key_exists('dry-run', $raw);
+
+        if ($dryRun && $downBase === null) {
+            throw new ContribMergeUsageException('--dry-run only means something together with --downbase');
+        }
+
+        return new self(
+            pr: (int) $pr,
+            owner: $owner,
+            repository: self::optionString($raw, 'repo'),
+            changeLog: array_key_exists('changelog', $raw),
+            merge: array_key_exists('merge', $raw),
+            downBase: $downBase,
+            dryRun: $dryRun,
+        );
+    }
+
+    /**
+     * @param array<string, mixed> $raw
+     */
+    private static function optionString(array $raw, string $name): ?string
+    {
+        $value = $raw[$name] ?? null;
+        if (! is_string($value) || trim($value) === '') {
+            return null;
+        }
+
+        return trim($value);
+    }
+
+    public static function usage(ConsoleOutput $output): void
+    {
+        foreach ([
+            'contrib-merge --pr 123',
+            'contrib-merge --pr 123 --changelog',
+            'contrib-merge --pr 123 --merge',
+            'contrib-merge --pr 123 --downbase 5.11.x',
+            'contrib-merge --pr 123 --downbase 5.11.x --dry-run',
+            'contrib-merge --pr 1 --owner williamdes --repo test-repo --merge',
+            'contrib-merge --pr 1 --org sudo-bot --repo action-doctum --merge',
+        ] as $usage) {
+            $output->line('Use: ' . $usage);
+        }
+    }
+}
+
+final class ContribMerge
+{
+    /**
+     * Generated files: a conflict on those is expected when a change is
+     * replayed onto another branch, and is settled by regenerating them.
+     */
+    private const BASELINE_FILES = ['phpstan-baseline.neon', 'psalm-baseline.xml'];
+
+    public function __construct(
+        private GitRepository $git,
+        private GitHubClient $api,
+        private ConsoleOutput $output,
+        private BaselineRegenerator $baselines,
+    ) {
+    }
+
+    public function run(Options $options): void
+    {
+        $this->output->line('Slug: ' . $this->api->slug());
+
+        if ($options->changeLog) {
+            $this->changeLogPr($options->pr);
+
+            return;
+        }
+
+        if ($options->downBase !== null) {
+            $this->downBasePr($options->pr, $options->downBase, $options->dryRun);
+
+            return;
+        }
+
+        $this->mergePr($options->pr, $options->merge);
+    }
+
+    private function changeLogPr(int $prId): void
+    {
+        $pr = $this->api->pullRequest($prId);
+        $this->output->line('Title: ' . $pr->title);
+
+        $links = $this->extractLinks($pr->body);
+        $this->output->line('--Fixes--');
         foreach ($links['fixes'] as $issueId) {
-            $issueData = self::getIssue((int) $issueId);
-            echo '- issue #' . $issueId . ' ' . $issueData['title'] . PHP_EOL;
+            $this->output->line('- issue #' . $issueId . ' ' . $this->api->issue((int) $issueId)->title);
         }
-        echo '--Closes--' . PHP_EOL;
+        $this->output->line('--Closes--');
         foreach ($links['closes'] as $issueId) {
-            $issueData = self::getIssue((int) $issueId);
-            echo '- issue #' . $issueId . ' ' . $issueData['title'] . PHP_EOL;
+            $this->output->line('- issue #' . $issueId . ' ' . $this->api->issue((int) $issueId)->title);
         }
     }
 
-    private static function mergePr(int $prId, bool $doMerge): void
+    private function mergePr(int $prId, bool $doMerge): void
     {
-        $prData = self::ghAPI(
-            sprintf(
-                '/repos/%s/%s/pulls/%s',
-                self::$OWNER,
-                self::$REPO,
-                $prId
-            )
+        $pr = $this->api->pullRequest($prId);
+
+        $this->output->line('By: ' . $pr->headUserName . ' (' . $pr->authorAssociation . ')');
+        $this->output->line(
+            'Stats: commits: ' . $pr->commitsCount
+            . ', add: ' . $pr->additions
+            . ', del: ' . $pr->deletions
+            . ', mod: ' . $pr->changedFiles
+        );
+        $this->output->line('Title: ' . $pr->title);
+        $this->output->line('Body: ' . PHP_EOL . $pr->body);
+
+        $mergeMessage = $this->mergeMessage($pr);
+        $target = $this->fetchPullRequestHead($pr);
+
+        if (! $doMerge) {
+            $this->output->line('Branch ' . $target->ref);
+            $this->output->line('Merge message: ');
+            $this->output->line('Merge template: ');
+            $this->output->line($mergeMessage);
+
+            return;
+        }
+
+        if ($pr->merged) {
+            throw new ContribMergeException('Already merged !');
+        }
+        if (! $this->git->isClean()) {
+            throw new ContribMergeException('The repository is not clean !');
+        }
+        $currentBranch = $this->git->currentBranch();
+        if ($currentBranch !== $pr->baseRef) {
+            throw new ContribMergeException('The current branch is not the branch ' . $pr->baseRef . ' !');
+        }
+
+        $this->output->line('Merging branch ' . $target->ref . ' into ' . $pr->baseRef);
+        $result = $this->git->merge($target->ref, $mergeMessage, $this->git->signoffRequired());
+        $this->output->line($result->stdout);
+        if (! $result->isOk()) {
+            throw new ContribMergeException($result->failureDetails());
+        }
+    }
+
+    /**
+     * Ship a pull-request that was opened against the wrong branch onto the
+     * branch it belongs to. Atomic: the local replay either lands completely
+     * and is pushed, or nothing on GitHub changes.
+     */
+    private function downBasePr(int $prId, string $lowerBranch, bool $dryRun): void
+    {
+        GitRefName::assertValidBranch($lowerBranch);
+
+        $pr = $this->api->pullRequest($prId);
+        $this->output->line(
+            'Downbase: ' . $this->api->slug() . '#' . $prId . ' ' . $pr->baseRef . ' -> ' . $lowerBranch
+            . ($dryRun ? ' (dry-run)' : '')
+        );
+        $this->output->line(
+            'Stats: commits: ' . $pr->commitsCount
+            . ', add: ' . $pr->additions
+            . ', del: ' . $pr->deletions
+            . ', mod: ' . $pr->changedFiles
+        );
+        $this->output->line('Title: ' . $pr->title);
+
+        if ($pr->merged) {
+            throw new ContribMergeException('Already merged !');
+        }
+        if ($pr->baseRef === $lowerBranch) {
+            throw new ContribMergeException('The pull-request already targets ' . $lowerBranch . ', nothing to downbase.');
+        }
+        if ($pr->baseRef === '' || $pr->headRef === '') {
+            throw new ContribMergeException('The pull-request has no usable base or head ref.');
+        }
+        GitRefName::assertValidBranch($pr->headRef);
+        if ($pr->headSha === '') {
+            throw new ContribMergeException('The pull-request head has no revision to push.');
+        }
+        if ($pr->headSshUrl === '') {
+            throw new ContribMergeException('The pull-request head repository is gone, nothing can be pushed.');
+        }
+        if ($pr->isFromFork() && ! $pr->maintainerCanModify) {
+            throw new ContribMergeException(
+                'The fork ' . $pr->headRepository . ' does not allow maintainers to push'
+                . ' (the "allow edits" checkbox is off), so this pull-request cannot be downbased.'
+            );
+        }
+
+        $head = $this->fetchPullRequestHead($pr);
+        $pushedSha = $this->git->revision($head->ref);
+        if ($pushedSha === null) {
+            throw new ContribMergeException('Unable to resolve ' . $head->ref . ' after fetching it.');
+        }
+
+        $commits = $this->api->pullRequestCommitShas($prId);
+        if ($commits === []) {
+            throw new ContribMergeException('The pull-request has no commits to replay.');
+        }
+
+        $worktreePath = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR)
+            . DIRECTORY_SEPARATOR
+            . 'contrib-merge-' . preg_replace('/[^A-Za-z0-9._-]/', '-', (string) $this->api->slug())
+            . '-' . $prId . '-' . bin2hex(random_bytes(4));
+
+        $this->git->pruneWorktrees();
+        $this->output->line('Creating the worktree ' . $worktreePath);
+        $created = false;
+        try {
+            $this->git->addWorktree($worktreePath, $head->ref);
+            $created = true;
+            $worktree = $this->git->inPath($worktreePath);
+
+            $lowerRef = $this->resolveLowerBranchRef($lowerBranch);
+            $this->output->line('Resetting ' . $worktreePath . ' to ' . $lowerRef);
+            $worktree->resetHard($lowerRef);
+
+            [$replayed, $baselineConflicts] = $this->replayCommits($worktree, $commits);
+            if ($baselineConflicts > 0) {
+                $this->baselines->regenerate($worktree, $lowerBranch, self::BASELINE_FILES);
+            }
+
+            $this->output->line('Replayed ' . $replayed . ' commit(s), ' . $baselineConflicts . ' baseline conflict(s)');
+            $diffStat = $worktree->diffStat($lowerRef, 'HEAD');
+            $this->output->line($diffStat === '' ? 'No file changed' : $diffStat);
+
+            if ($dryRun) {
+                $this->output->line('Would run: PATCH /repos/' . $this->api->slug() . '/pulls/' . $prId
+                    . ' {"base":"' . $lowerBranch . '"}');
+                $this->output->line('Would run: ' . $worktree->pushCommandLine($head->remote, $pr->headRef, $pushedSha));
+                $this->output->line('  (pushes to ' . $pr->headSshUrl . ')');
+                $this->output->line('Dry-run: nothing was pushed and the pull-request was left alone.');
+
+                return;
+            }
+
+            $this->output->line('Editing the pull-request base to ' . $lowerBranch);
+            $this->api->updatePullRequestBase($prId, $lowerBranch);
+
+            $this->output->line('Force pushing ' . $head->remote . '/' . $pr->headRef);
+            $push = $worktree->pushWithLease($head->remote, $pr->headRef, $pushedSha);
+            if (! $push->isOk()) {
+                $this->restoreBase($pr, $prId);
+                throw new ContribMergeException(
+                    'The pull-request base was restored to ' . $pr->baseRef . ' because the push failed.'
+                    . PHP_EOL . $push->failureDetails()
+                );
+            }
+            if (trim($push->stdout) !== '') {
+                $this->output->line(trim($push->stdout));
+            }
+            if (trim($push->stderr) !== '') {
+                $this->output->line(trim($push->stderr));
+            }
+
+            $this->output->line(
+                'Done: ' . $this->api->slug() . '#' . $prId . ' now targets ' . $lowerBranch . '.'
+            );
+        } finally {
+            if ($created && is_dir($worktreePath)) {
+                try {
+                    $this->git->removeWorktree($worktreePath);
+                } catch (ContribMergeException $exception) {
+                    $this->output->error('Unable to remove the worktree ' . $worktreePath . ': ' . $exception->getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * @param string[] $commits
+     *
+     * @return array{0: int, 1: int} the replayed commit count and the number of
+     *                               conflicts that were baseline-only
+     */
+    private function replayCommits(GitRepository $worktree, array $commits): array
+    {
+        $replayed = 0;
+        $baselineConflicts = 0;
+
+        foreach ($commits as $sha) {
+            $result = $worktree->cherryPick($sha);
+            if ($result->isOk()) {
+                $replayed++;
+                $this->output->line('  picked ' . $worktree->shortSha($sha) . ' ' . $worktree->commitSubject($sha));
+
+                continue;
+            }
+
+            $conflicts = $worktree->conflictedFiles();
+            $output = $result->stdout . $result->stderr;
+            if ($conflicts === [] && str_contains($output, 'is now empty')) {
+                // The change is already on the lower branch: an empty commit
+                // carries nothing, so it is dropped instead of forced in.
+                // `--skip` needs a running sequencer, `--abort` leaves HEAD
+                // where it was, which is the same net effect for one commit.
+                if (! $worktree->cherryPickSkip()->isOk()) {
+                    $worktree->cherryPickAbort();
+                }
+                $this->output->line('  skipped ' . $worktree->shortSha($sha) . ' (already on the branch)');
+
+                continue;
+            }
+            if ($conflicts === []) {
+                $worktree->cherryPickAbort();
+                throw new ContribMergeException(
+                    'Cherry-pick of ' . $worktree->shortSha($sha) . ' failed:' . PHP_EOL . $result->failureDetails()
+                );
+            }
+
+            $baselineOnly = array_values(array_filter(
+                $conflicts,
+                static fn (string $file): bool => in_array(basename($file), self::BASELINE_FILES, true)
+            ));
+            if (count($baselineOnly) !== count($conflicts)) {
+                $real = array_values(array_diff($conflicts, $baselineOnly));
+                $worktree->cherryPickAbort();
+                throw new ContribMergeException(
+                    'Cherry-pick of ' . $worktree->shortSha($sha) . ' conflicts on '
+                    . implode(', ', $real) . ': the pull-request must be rebased by hand.'
+                );
+            }
+
+            $this->output->line(
+                '  conflict on ' . implode(', ', $baselineOnly) . ' (generated files, kept for regeneration)'
+            );
+            $worktree->checkoutTheirs($baselineOnly);
+            $worktree->stage($baselineOnly);
+            $continued = $worktree->cherryPickContinue();
+            if (! $continued->isOk()) {
+                $worktree->cherryPickAbort();
+                throw new ContribMergeException(
+                    'Resolving the baseline conflict of ' . $worktree->shortSha($sha) . ' failed:'
+                    . PHP_EOL . $continued->failureDetails()
+                );
+            }
+
+            $baselineConflicts++;
+            $replayed++;
+            $this->output->line('  picked ' . $worktree->shortSha($sha) . ' ' . $worktree->commitSubject($sha));
+        }
+
+        return [$replayed, $baselineConflicts];
+    }
+
+    /**
+     * Find the lower branch as a local remote-tracking ref, fetching it first
+     * when this clone never saw it.
+     */
+    private function resolveLowerBranchRef(string $lowerBranch): string
+    {
+        GitRefName::assertValidBranch($lowerBranch);
+
+        $candidates = [];
+        foreach ($this->git->remotes() as $remote) {
+            $candidates[] = $remote['name'] . '/' . $lowerBranch;
+        }
+        // `origin` is the base repository in the common case.
+        usort(
+            $candidates,
+            static fn (string $left, string $right): int => (int) str_starts_with($right, 'origin/') <=> (int) str_starts_with($left, 'origin/')
         );
 
-        //var_dump($prData['head']);
-        echo 'By: ' . $prData['head']['user']['login'] . ' (' . $prData['author_association'] . ')' . PHP_EOL;
-        echo 'Stats: commits: ' . $prData['commits']
-            . ', add: ' . $prData['additions']
-            . ', del: ' . $prData['deletions']
-            . ', mod: ' . $prData['changed_files']
-            . PHP_EOL;
-        echo 'Title: ' . $prData['title'] . PHP_EOL;
-        echo 'Body: ' . PHP_EOL . $prData['body'] . PHP_EOL;
-        $links = self::getLinks($prData['body'] ?? '');
+        foreach ($candidates as $candidate) {
+            if ($this->git->revisionExists($candidate)) {
+                return $candidate;
+            }
+        }
+
+        $origin = $this->git->remoteUrl('origin');
+        if ($origin !== null && $origin !== '') {
+            $this->output->line('Fetching origin to find ' . $lowerBranch);
+            $this->git->fetch('origin', ['+refs/heads/' . $lowerBranch . ':refs/remotes/origin/' . $lowerBranch]);
+            if ($this->git->revisionExists('origin/' . $lowerBranch)) {
+                return 'origin/' . $lowerBranch;
+            }
+        }
+
+        throw new ContribMergeException(
+            'Unable to find ' . $lowerBranch . ' in any remote: fetch it first, then retry.'
+        );
+    }
+
+    /**
+     * The remote to fetch the pull-request head from, and the branch to push
+     * it back to. A fork is added under the contributor's name so the very
+     * same remote serves both directions.
+     */
+    private function fetchPullRequestHead(PullRequest $pr): RemoteTarget
+    {
+        if ($pr->headRef === '') {
+            throw new ContribMergeException('The pull-request head has no branch name.');
+        }
+        GitRefName::assertValidBranch($pr->headRef);
+        if ($pr->headSshUrl === '') {
+            throw new ContribMergeException('The pull-request head repository is gone.');
+        }
+
+        foreach ($this->git->remotes() as $remote) {
+            if ($this->isRepoUrl($remote['url'], $pr->headSshUrl, $pr->headCloneUrl)) {
+                return new RemoteTarget($remote['name'], $remote['name'] . '/' . $pr->headRef);
+            }
+        }
+
+        $remoteName = $pr->headUserName !== '' ? $pr->headUserName : 'pr-head';
+        GitRefName::assertValidRemote($remoteName);
+        $existingUrl = $this->git->remoteUrl($remoteName);
+        if ($existingUrl !== null && ! $this->isRepoUrl($existingUrl, $pr->headSshUrl, $pr->headCloneUrl)) {
+            // The name is taken by another repository: never fetch or push a
+            // branch of the pull-request into an unrelated remote.
+            $remoteName .= '-pull-' . $pr->number;
+            GitRefName::assertValidRemote($remoteName);
+        }
+        if ($this->git->remoteUrl($remoteName) === null) {
+            $this->output->line('Adding remote ' . $remoteName . ' (' . $pr->headSshUrl . ')');
+            $this->git->addRemote($remoteName, $pr->headSshUrl);
+        }
+
+        $this->output->line('Fetching remote ' . $remoteName);
+        $this->git->fetch(
+            $remoteName,
+            ['+refs/heads/' . $pr->headRef . ':refs/remotes/' . $remoteName . '/' . $pr->headRef]
+        );
+        $ref = $remoteName . '/' . $pr->headRef;
+        if (! $this->git->revisionExists($ref)) {
+            throw new ContribMergeException('Unable to fetch ' . $ref . ' from ' . $pr->headSshUrl . '.');
+        }
+
+        return new RemoteTarget($remoteName, $ref);
+    }
+
+    /**
+     * Git displays a remote URL after applying the url.<base>.insteadOf rules,
+     * so an SSH remote can show up as its HTTPS form (fetch over HTTPS, push
+     * over SSH): both forms are the same repository.
+     */
+    private function isRepoUrl(string $url, string $sshUrl, string $httpsUrl): bool
+    {
+        foreach ([$sshUrl, $httpsUrl] as $repoUrl) {
+            if ($repoUrl !== '' && ($url === $repoUrl || $url === $repoUrl . '.git')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function mergeMessage(PullRequest $pr): string
+    {
+        $links = $this->extractLinks($pr->body);
         $specialMentions = '';
         foreach ($links['fixes'] as $issueId) {
             $specialMentions .= 'Fixes: #' . $issueId . PHP_EOL;
@@ -164,381 +1633,112 @@ final class ContribMerge {
         foreach ($links['closes'] as $issueId) {
             $specialMentions .= 'Closes: #' . $issueId . PHP_EOL;
         }
-        foreach ($links['custom'] as $linkName => $links) {
-            foreach ($links as $link) {
+        foreach ($links['custom'] as $linkName => $customLinks) {
+            foreach ($customLinks as $link) {
                 $specialMentions .= $linkName . ': ' . $link . PHP_EOL;
             }
         }
-        $remoteName = $prData['head']['user']['login'];
 
-        $mergeRemoteUrl = $prData['head']['repo']['ssh_url'];
-        $mergeRemoteHttpsUrl = $prData['head']['repo']['clone_url'];
-        $baseRemoteUrl = $prData['base']['repo']['ssh_url'];
-        $branchMergedIntoRef = $prData['base']['ref'];
-        $branchRef = $prData['head']['ref'];
-        $branchShaRef = $prData['head']['sha'];
-
-        $mergeRef = self::addRemoteIfMissingAndFetch(
-            $baseRemoteUrl,
-            $mergeRemoteUrl,
-            $mergeRemoteHttpsUrl,
-            $remoteName,
-            $branchRef,
-            $branchShaRef,
-            $prId
-        );
-        $prTitle = $prData["title"];
-        $mergeMsg = <<<MD
-        Merge #$prId - $prTitle
-
-        Pull-request: #$prId
-        $specialMentions
-
-        MD;
-
-        $repoPath = getcwd();
-        if ($doMerge === false) {
-            echo 'Branch ' . $mergeRef . PHP_EOL;
-            echo 'Merge message: ' . PHP_EOL;
-            echo 'Merge template: ' . PHP_EOL;
-            echo $mergeMsg;
-        }
-        if ($doMerge) {
-            if ($prData['merged']) {
-                echo 'Already merged ! ' . PHP_EOL;
-                exit(1);
-            }
-            $isRepoClean = trim(shell_exec(
-                <<<SH
-                cd '$repoPath';
-                git status --porcelain;
-                SH
-            ) ?? '');
-            if ($isRepoClean !== '') {
-                echo 'The repository is not clean ! ' . PHP_EOL;
-                exit(1);
-            }
-            $currentBranch = trim(shell_exec(
-                <<<SH
-                cd '$repoPath';
-                git branch --show-current;
-                SH
-            ) ?? '');
-
-            if ($currentBranch !== $branchMergedIntoRef) {
-                echo 'The current branch is not the branch ' . $branchMergedIntoRef . ' ! ' . PHP_EOL;
-                exit(1);
-            }
-
-            echo 'Merging branch ' . $mergeRef . ' into ' . $branchMergedIntoRef . PHP_EOL;
-            $mergeMsg = escapeshellarg($mergeMsg);
-            $signoff = trim(shell_exec(
-                <<<SH
-                cd '$repoPath';
-                git config format.signoff;
-                SH
-            ) ?? '');
-
-            $signoffOption = $signoff !== 'false' ? '--signoff' : '';
-            $gitRemotes = shell_exec(
-                <<<SH
-                cd '$repoPath';
-                git merge '$mergeRef' --no-ff $signoffOption -m $mergeMsg;
-                SH
-            );
-        }
+        return 'Merge #' . $pr->number . ' - ' . $pr->title . "\n\n"
+            . 'Pull-request: #' . $pr->number . "\n"
+            . $specialMentions
+            . "\n";
     }
 
     /**
-     * @param string $baseRemoteUrl The repo to merge into
-     * @param string $mergeRemoteUrl The repo asking for the merge
-     * @param string $mergeRemoteHttpsUrl The same repo, in its HTTPS form
-     * @return string the reference to merge remote-name/branch-name
+     * @return array{fixes: string[], closes: string[], custom: array<string, string[]>}
      */
-    private static function addRemoteIfMissingAndFetch(
-        string $baseRemoteUrl, string $mergeRemoteUrl, string $mergeRemoteHttpsUrl, string $remoteName, string $branchRef, string $branchShaRef, int $prId
-    ): string
+    private function extractLinks(string $content): array
     {
-        $repoPath = getcwd();
-
-        // First strategy: check that refs/remotes/<origin_name>/pull/<pr_id>/head are fetched (and setup)
-
-        $allPROrigins = <<<SH
-        cd '$repoPath';
-        LC_ALL=C.UTF-8 git show-ref | grep -P -- 'refs/remotes/.*/pull/'
-        SH;
-        $allPRsList = shell_exec($allPROrigins);
-
-        // Do they have such refs ?
-        if (trim($allPRsList) !== '') {
-            // If the sha is not found in the output, then fetch all
-            if (! str_contains($allPRsList, $branchShaRef)) {
-                $prOrigins = <<<SH
-                cd '$repoPath';
-                git fetch -q;
-                LC_ALL=C.UTF-8 git show-ref | grep -P -- 'refs/remotes/$prId/pull/'
-                SH;
-                $allPRsList = shell_exec($prOrigins);
-            }
-
-            $separator = "\n";
-            $line = strtok($allPRsList, $separator);
-            while ($line !== false) {
-                # do something with $line
-                $line = strtok($separator);
-                if ($line === false) {
-                    continue;
-                }
-                [$lineRemoteHash, $lineRemoteRef] = explode(" ", $line);
-
-                if ($lineRemoteHash === $branchShaRef && str_contains($lineRemoteRef, '/pull/' . $prId)) {
-                    echo 'Using ' . $lineRemoteRef . ' as the merge ref.' . PHP_EOL;
-                    return $lineRemoteRef;
-                }
-            }
-        }
-
-        // Second strategy: find the remote in the list of remotes
-        $findOriginCommand = <<<SH
-        cd '$repoPath';
-        LC_ALL=C.UTF-8 git remote -v
-        SH;
-        $gitRemoteOriginList = shell_exec($findOriginCommand);
-        $separator = "\n";
-        $line = strtok($gitRemoteOriginList, $separator);
-        while ($line !== false) {
-            // Read the token first and advance afterwards. Advancing first discarded whichever
-            // remote `git remote -v` lists first, and that is `origin` in the common case of a
-            // repository that has only one — so the remote this is looking for was the one line
-            // never examined, and detection fell through to the fallbacks below every time.
-            [$lineRemoteName, $lineRemoteData] = explode("\t", $line);
-            [$lineRemoteURL, $lineRemoteType] = explode(" ", $lineRemoteData);
-            $line = strtok($separator);
-            if ($lineRemoteType !== '(fetch)') {
-                continue;
-            }
-
-            if (self::isRepoUrl($lineRemoteURL, $mergeRemoteUrl, $mergeRemoteHttpsUrl)) {
-                return $lineRemoteName . '/' . $branchRef;
-            }
-        }
-
-        // Fallback to finding "origin"
-        //echo 'Unable to detect ' . $mergeRemoteUrl . ' using the "origin" remote instead ' . PHP_EOL;
-        // `shell_exec` hands back the command's stdout with its trailing newline, so comparing it
-        // as it comes was never equal to the URL — this fallback could not succeed. Trimmed, it is
-        // the plain URL the comparison expects.
-        $gitRemoteOrigin = trim((string) shell_exec(
-            <<<SH
-            cd '$repoPath';
-            git remote get-url origin;
-            SH
-        ));
-
-        // If the origin exists as "origin", then use it
-        if (self::isRepoUrl($gitRemoteOrigin, $mergeRemoteUrl, $mergeRemoteHttpsUrl)) {
-            $remoteName = 'origin';
-
-            echo 'Fetching remote ' . $remoteName . PHP_EOL;
-            shell_exec(
-                <<<SH
-                cd '$repoPath';
-                git fetch $remoteName;
-                SH
-            );
-            return $remoteName . '/' . $branchRef;
-        }
-
-        // Third strategy: add the remote and fetch it
-        echo 'Remote (' . $remoteName . '): ' . $mergeRemoteUrl . PHP_EOL;
-
-        // Asked by name, because a name is what the fetch below needs. Searching the URLs in
-        // `git remote -v` answered a different question: when some other remote already carried this
-        // URL — `origin` usually does — the add was skipped and the fetch then asked for a name that
-        // did not exist, which is how this reported a missing repository instead of fetching.
-        $gitRemoteExists = trim((string) shell_exec(
-            <<<SH
-            cd '$repoPath';
-            git remote get-url $remoteName 2>/dev/null;
-            SH
-        )) !== '';
-        if (! $gitRemoteExists) {
-            echo 'Adding remote ' . $remoteName . PHP_EOL;
-            shell_exec(
-                <<<SH
-                cd '$repoPath';
-                git remote add $remoteName $mergeRemoteUrl;
-                SH
-            );
-        }
-        echo 'Fetching remote ' . $remoteName . PHP_EOL;
-        shell_exec(
-            <<<SH
-            cd '$repoPath';
-            git fetch $remoteName;
-            SH
-        );
-        return $remoteName . '/' . $branchRef;
+        return PullRequestLinks::extract($content, $this->git->configValue('contrib-merge.format'));
     }
 
-    /**
-     * Git displays a remote URL after applying the url.<base>.insteadOf rules, so an SSH remote
-     * can show up as its HTTPS form (fetch over HTTPS, push over SSH): both forms are the same repo.
-     */
-    private static function isRepoUrl(string $url, string $sshUrl, string $httpsUrl): bool
+    private function restoreBase(PullRequest $pr, int $prId): void
     {
-        foreach ([$sshUrl, $httpsUrl] as $repoUrl) {
-            if ($url === $repoUrl || $url === $repoUrl . '.git') {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * @return array{
-     * fixes: string[],
-     * closes: string[],
-     * custom: array<string,string[]>,
-     * }
-     */
-    private static function getLinks(string $content): array
-    {
-        $reFixes = '/fixes(?:|:) #(\d+)/mi';
-        $reCloses = '/closes(?:|:) #(\d+)/mi';
-        $repoPath = getcwd();
-        $contribMergeFromats = shell_exec(
-            <<<SH
-            cd '$repoPath';
-            git config contrib-merge.format;
-            SH
-        );
-
-        $customFormats = [];
-        if (! empty($contribMergeFromats)) {
-            $matches = [];
-            preg_match_all($contribMergeFromats, $content, $matches, PREG_SET_ORDER);
-            foreach ($matches as $match) {
-                foreach ($match as $matchKey => $matchResult) {
-                    if (is_numeric($matchKey)) {
-                        continue;
-                    }
-                    if (! isset($customFormats[$matchKey])) {
-                        $customFormats[$matchKey] = [];
-                    }
-                    $customFormats[$matchKey][] = trim($matchResult);
-                }
-            }
-        }
-
-
-        $matchesFixes = [];
-        $matchesCloses = [];
-
-        preg_match_all($reFixes, $content, $matchesFixes, PREG_PATTERN_ORDER);
-
-        preg_match_all($reCloses, $content, $matchesCloses, PREG_PATTERN_ORDER);
-
-        return [
-            'fixes' => $matchesFixes[1],
-            'closes' => $matchesCloses[1],
-            'custom' => $customFormats,
-        ];
-    }
-
-    private static function ghAPI(string $path, string $method = 'GET'): mixed {
-        $currentDir = getcwd();
-        $token = null;
-        if ($currentDir && is_dir($currentDir)) {
-            $token = shell_exec(
-                <<<SH
-                git config github.token
-                SH
+        try {
+            $this->api->updatePullRequestBase($prId, $pr->baseRef);
+            $this->output->error('The pull-request base was put back to ' . $pr->baseRef . '.');
+        } catch (ContribMergeException $exception) {
+            $this->output->error(
+                'The pull-request base could not be put back to ' . $pr->baseRef . ': ' . $exception->getMessage()
             );
         }
-        if ($token !== null) {
-            $token = trim($token);
-            echo 'Using the token from the GitHub local config at: ' . $currentDir . PHP_EOL;
-        }
-
-        $headers = empty($token) ? [
-                'Accept' => 'application/vnd.github+json',
-                'X-GitHub-Api-Version' => '2022-11-28',
-            ]
-            :
-            [
-                'Authorization' => 'Bearer ' . $token,
-                'Accept' => 'application/vnd.github+json',
-                'X-GitHub-Api-Version' => '2022-11-28',
-            ];
-
-        $data = json_decode(self::makeRequest(
-            'https://api.github.com' . $path,
-            $headers,
-            $method
-        ), true);
-
-        if (isset($data['status']) && ((int) $data['status']) !== 200) {
-            echo 'Path: ' . $path . PHP_EOL;
-            echo 'Headers: ' . json_encode($headers, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
-            echo 'Status (from json): ' . $data['status'] . PHP_EOL;
-            echo $data['message'] . PHP_EOL;
-            echo ($data['documentation_url'] ?? '' ). PHP_EOL;
-            exit(1);
-        }
-
-        return $data;
-    }
-
-    /**
-     * Make a HTTP request
-     *
-     * @param string $url The URL
-     * @param array<string,string>|string[] $http_headers The headers
-     * @param string $method The HTTP verb
-     * @return string The output
-     */
-    protected static function makeRequest(string $url, array $http_headers, string $method): string
-    {
-        $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $url);
-        curl_setopt($ch, CURLOPT_USERAGENT, '@wdes contribution merger');
-        curl_setopt($ch, CURLOPT_HEADER, false);
-        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
-        $headersToSend = [];
-        foreach ($http_headers as $headerName => $headerValue) {
-            $headersToSend[] = $headerName . ': ' . $headerValue;
-        }
-        curl_setopt($ch, CURLOPT_HTTPHEADER, $headersToSend);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        $dataOut = curl_exec($ch);
-        //$httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-        if (curl_errno($ch) !== 0) {
-            $errorNo = curl_errno($ch);
-            $description = curl_strerror($errorNo);
-            echo sprintf(
-                'cURL error (%d: %s) for url %s',
-                $errorNo,
-                $description,
-                $url
-            );
-            curl_close($ch);
-            return '';
-        }
-        curl_close($ch);
-        return $dataOut;
     }
 }
 
-$longopts  = array(
-    'pr:',// Required value
-    'changelog',// No value
-    'merge',// No value
-    'owner:',// Required value
-    'org:',// Required value
-    'repo:',// Required value
-);
-$options = getopt($shortopts = '', $longopts);
-ContribMerge::run($options);
-echo PHP_EOL;
+final class Cli
+{
+    public static function main(): int
+    {
+        $output = ConsoleOutput::create();
+
+        try {
+            $rawOptions = getopt('', Options::LONG_OPTIONS);
+            $options = Options::fromGetoptArray(is_array($rawOptions) ? $rawOptions : []);
+        } catch (ContribMergeUsageException $exception) {
+            Options::usage($output);
+            $output->error($exception->getMessage());
+
+            return 1;
+        }
+
+        try {
+            $processRunner = new SystemProcessRunner();
+            $git = new GitRepository($processRunner, (string) getcwd());
+            $slug = self::resolveSlug($options, $git, $output);
+            if ($slug === null) {
+                $output->error('Missing repo or owner/org');
+                $output->error('Owner/org: ' . ($options->owner ?? ''));
+                $output->error('Repo: ' . ($options->repository ?? ''));
+
+                return 1;
+            }
+
+            $api = new GitHubClient(
+                new CurlHttpTransport(),
+                $slug,
+                GitHubTokenResolver::resolve($git, $output)
+            );
+            (new ContribMerge($git, $api, $output, new BaselineRegenerator($processRunner, $output)))->run($options);
+        } catch (ContribMergeException $exception) {
+            $output->error($exception->getMessage());
+
+            return 1;
+        }
+
+        return 0;
+    }
+
+    private static function resolveSlug(Options $options, GitRepository $git, ConsoleOutput $output): ?RepositorySlug
+    {
+        if ($options->owner !== null && $options->repository !== null) {
+            return new RepositorySlug($options->owner, $options->repository);
+        }
+        if ($options->owner !== null || $options->repository !== null) {
+            return null;
+        }
+
+        $remoteUrl = $git->detectBaseRepositoryUrl();
+        if ($remoteUrl === null) {
+            return null;
+        }
+        $slug = RepositorySlug::fromRemoteUrl($remoteUrl);
+        if ($slug === null) {
+            $output->error('Unable to auto detect the slug from remote URL: ' . $remoteUrl);
+
+            return null;
+        }
+
+        $output->line('--Auto detected settings--');
+        $output->line('Owner/org: ' . $slug->owner);
+        $output->line('Repo: ' . $slug->repository);
+        $output->line('--Auto detected settings--');
+
+        return $slug;
+    }
+}
+
+$scriptFilename = $_SERVER['SCRIPT_FILENAME'] ?? '';
+if (PHP_SAPI === 'cli' && is_string($scriptFilename) && realpath($scriptFilename) === __FILE__) {
+    exit(Cli::main());
+}
